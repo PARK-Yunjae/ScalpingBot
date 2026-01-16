@@ -448,11 +448,17 @@ class TradingEngine:
                     logger.warning("🛑 Kill Switch 활성화, 루프 중지")
                     break
                 
-                # 장 운영 시간 체크
+               # 장 운영 시간 체크
                 if not self._is_trading_time():
-                    # 장 마감 체크
+                    # 장 마감 체크 (15:20~15:30)
                     if self._is_closing_time():
                         self._handle_market_close()
+                    
+                    # 장 종료 후 자동 종료 (15:30 이후)
+                    current_str = datetime.now().strftime("%H:%M")
+                    if current_str > "15:30":
+                        logger.info("📴 장 종료 - 프로그램 자동 종료")
+                        break
                     
                     time.sleep(10)
                     continue
