@@ -1,0 +1,138 @@
+# ============================================================================
+# ScalpingBot v2.4 설정 파일
+# ============================================================================
+# 모드 설명:
+#   - LIVE_DATA_ONLY: 실시간 데이터 수집만, 실제 매매 없음 (테스트용)
+#   - LIVE_MICRO: 소액 매매 (종목당 10만원 이하)
+#   - LIVE: 실전 매매
+# ============================================================================
+
+# -----------------------------------------
+# 운영 모드 설정
+# -----------------------------------------
+mode: LIVE_DATA_ONLY  # LIVE_DATA_ONLY / LIVE_MICRO / LIVE
+
+# -----------------------------------------
+# AI 설정 (Qwen3:8b via Ollama)
+# -----------------------------------------
+ai:
+  model: qwen3:8b              # Ollama 모델명
+  api_url: http://localhost:11434/api/generate  # Ollama API 엔드포인트
+  timeout: 10                  # AI 응답 타임아웃 (초)
+  max_queue_size: 50           # AI 요청 큐 최대 크기
+  retry_count: 2               # 실패 시 재시도 횟수
+  
+  # AI 판단 임계값
+  min_confidence: 0.6          # 최소 신뢰도 (0.0 ~ 1.0)
+
+# -----------------------------------------
+# 매매 전략 설정
+# -----------------------------------------
+trading:
+  # 진입 조건
+  min_score: 70                # 최소 진입 점수 (100점 만점)
+  min_ai_confidence: 0.7       # AI 최소 신뢰도
+  
+  # 손절/익절 설정 (%)
+  stop_loss: -1.5              # 손절 라인
+  take_profit: 1.5             # 익절 라인
+  
+  # 트레일링 스탑 설정
+  trailing:
+    enabled: true
+    activation: 0.8            # 트레일링 시작 수익률 (%)
+    distance: 0.5              # 고점 대비 하락 허용폭 (%)
+  
+  # 시간 기반 설정
+  force_close_time: "14:50"    # 강제 청산 시각
+  market_open: "09:00"
+  market_close: "15:30"
+  
+  # 매수 검증
+  price_spike_threshold: 1.5   # AI 분석 후 급등 시 매수 취소 기준 (%)
+  cooldown_minutes: 10         # 매도 후 재매수 대기 시간 (분)
+
+# -----------------------------------------
+# 안전 장치 설정
+# -----------------------------------------
+safety:
+  # 포지션 제한
+  max_positions: 5             # 최대 동시 보유 종목 수
+  max_position_size: 500000    # 종목당 최대 투자금 (원)
+  
+  # 일일 손실 한도
+  max_daily_loss: -100000      # 일일 최대 손실 (원)
+  max_daily_loss_pct: -3.0     # 일일 최대 손실률 (%)
+  
+  # 연속 손절 제한
+  max_consecutive_losses: 5    # 연속 손절 허용 횟수
+  loss_cooldown_minutes: 30    # 연속 손절 시 휴식 시간 (분)
+  
+  # 지수 기반 비상 모드
+  index_emergency_threshold: -2.0   # 코스피 급락 시 비상모드 진입 (%)
+  index_conservative_threshold: -1.0  # 보수적 모드 진입 (%)
+
+# -----------------------------------------
+# 유니버스 설정 (종목 선정)
+# -----------------------------------------
+universe:
+  source: TV100                # 거래대금 상위 100종목
+  exclude_codes:               # 제외 종목 (관리종목 등)
+    - "000000"
+  min_price: 5000              # 최소 주가 (원)
+  max_price: 500000            # 최대 주가 (원)
+  min_volume: 100000           # 최소 거래량 (주)
+
+# -----------------------------------------
+# 지수 모니터 설정
+# -----------------------------------------
+market_monitor:
+  index_code: "0001"           # 코스피 지수 코드
+  check_interval: 10           # 체크 주기 (초)
+  ma_period: 20                # 이동평균 기간
+
+# -----------------------------------------
+# 점수 엔진 가중치 (총 85점 → 100점 정규화)
+# -----------------------------------------
+score_weights:
+  cci: 15                      # CCI 점수 (15점)
+  change_rate: 15              # 가격 변화율 (15점)
+  distance_ma20: 15            # 20일선 이격도 (15점)
+  consecutive_bullish: 10      # 연속 상승일 (10점)
+  volume_ratio: 15             # 거래량 비율 (15점)
+  candle_quality: 15           # 캔들 품질 (15점)
+  # 총합: 85점
+
+# -----------------------------------------
+# 데이터베이스 설정
+# -----------------------------------------
+database:
+  path: db/scalping.db         # SQLite DB 경로
+  backup_enabled: true
+  backup_time: "15:35"         # 일일 백업 시각
+
+# -----------------------------------------
+# 로깅 설정
+# -----------------------------------------
+logging:
+  level: INFO                  # DEBUG / INFO / WARNING / ERROR
+  file_path: logs/scalping.log
+  max_size_mb: 50
+  backup_count: 7              # 보관할 로그 파일 수
+  
+  # 상세 로깅 옵션
+  log_ai_prompts: true         # AI 프롬프트 로깅
+  log_api_calls: true          # API 호출 로깅
+
+# -----------------------------------------
+# Discord 알림 설정
+# -----------------------------------------
+discord:
+  enabled: true
+  notify_on:
+    buy: true                  # 매수 시 알림
+    sell: true                 # 매도 시 알림
+    stop_loss: true            # 손절 시 알림
+    take_profit: true          # 익절 시 알림
+    emergency: true            # 비상 상황 알림
+    daily_report: true         # 일일 리포트
