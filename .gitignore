@@ -205,6 +205,7 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+<<<<<<< HEAD
 
 # 기존 Python gitignore에 추가
 
@@ -233,3 +234,5 @@ __pycache__/
 # 가상환경
 venv/
 .venv/
+=======
+>>>>>>> 002f33c9cf30af5b3809e0dc071033a848baca64
