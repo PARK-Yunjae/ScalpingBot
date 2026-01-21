@@ -120,10 +120,11 @@ universe:
   condition_name: "TV100"
   target_size: 50
   min_price: 3000
-  max_price: 100000
+  max_price: 50000       # 5만원 이하 (스캘핑 적합)
   min_volume: 500000
   min_market_cap: 50000000000
   max_market_cap: 3000000000000
+  refresh_interval: 10   # 장중 갱신 주기 (분)
   
   prev_day:
     min_change_pct: 0.5

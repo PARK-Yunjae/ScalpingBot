@@ -513,6 +513,206 @@ def calculate_minute_indicators_df(
 
 
 # =============================================================================
+# MACD/RSI 돌파 감지 (사전 필터용)
+# =============================================================================
+
+def calculate_macd_signal(closes: List[float], fast: int = 9, slow: int = 18, signal: int = 6) -> Dict[str, Any]:
+    """
+    MACD 골든/데드크로스 감지
+    
+    Args:
+        closes: 종가 리스트 (최소 slow + signal개 필요)
+        fast: 단기 EMA 기간 (기본 9)
+        slow: 장기 EMA 기간 (기본 18)
+        signal: 시그널 EMA 기간 (기본 6)
+    
+    Returns:
+        dict: 골든크로스, 데드크로스, MACD 값 등
+    """
+    if len(closes) < slow + signal:
+        return {
+            'golden_cross': False,
+            'dead_cross': False,
+            'macd_above': False,
+            'macd_value': 0,
+            'signal_value': 0,
+            'histogram': 0,
+            'valid': False,
+        }
+    
+    closes_arr = np.array(closes)
+    
+    # EMA 계산
+    def ema(data, period):
+        alpha = 2 / (period + 1)
+        result = np.zeros_like(data)
+        result[0] = data[0]
+        for i in range(1, len(data)):
+            result[i] = alpha * data[i] + (1 - alpha) * result[i-1]
+        return result
+    
+    ema_fast = ema(closes_arr, fast)
+    ema_slow = ema(closes_arr, slow)
+    macd_line = ema_fast - ema_slow
+    signal_line = ema(macd_line, signal)
+    
+    # 현재/이전 값
+    curr_macd = macd_line[-1]
+    prev_macd = macd_line[-2]
+    curr_signal = signal_line[-1]
+    prev_signal = signal_line[-2]
+    
+    return {
+        'golden_cross': curr_macd >= curr_signal and prev_macd < prev_signal,
+        'dead_cross': curr_macd <= curr_signal and prev_macd > prev_signal,
+        'macd_above': curr_macd > curr_signal,
+        'macd_value': round(curr_macd, 4),
+        'signal_value': round(curr_signal, 4),
+        'histogram': round(curr_macd - curr_signal, 4),
+        'valid': True,
+    }
+
+
+def calculate_rsi_crossover(closes: List[float], period: int = 14, threshold: int = 30) -> Dict[str, Any]:
+    """
+    RSI 돌파 감지
+    
+    Args:
+        closes: 종가 리스트
+        period: RSI 기간 (기본 14)
+        threshold: 돌파 기준선 (기본 30)
+    
+    Returns:
+        dict: 상향돌파, 하향돌파, RSI 값 등
+    """
+    if len(closes) < period + 2:
+        return {
+            'upward_cross_30': False,
+            'downward_cross_70': False,
+            'rsi_value': 50,
+            'is_oversold': False,
+            'is_overbought': False,
+            'valid': False,
+        }
+    
+    closes_arr = np.array(closes)
+    deltas = np.diff(closes_arr)
+    
+    gains = np.where(deltas > 0, deltas, 0)
+    losses = np.where(deltas < 0, -deltas, 0)
+    
+    # Wilder's smoothing
+    avg_gain = np.zeros(len(deltas))
+    avg_loss = np.zeros(len(deltas))
+    
+    avg_gain[period-1] = np.mean(gains[:period])
+    avg_loss[period-1] = np.mean(losses[:period])
+    
+    for i in range(period, len(deltas)):
+        avg_gain[i] = (avg_gain[i-1] * (period-1) + gains[i]) / period
+        avg_loss[i] = (avg_loss[i-1] * (period-1) + losses[i]) / period
+    
+    rs = np.where(avg_loss != 0, avg_gain / avg_loss, 100)
+    rsi = 100 - (100 / (1 + rs))
+    
+    curr_rsi = rsi[-1]
+    prev_rsi = rsi[-2]
+    
+    return {
+        'upward_cross_30': curr_rsi >= 30 and prev_rsi < 30,
+        'downward_cross_70': curr_rsi <= 70 and prev_rsi > 70,
+        'rsi_value': round(curr_rsi, 2),
+        'prev_rsi': round(prev_rsi, 2),
+        'is_oversold': curr_rsi < 30,
+        'is_overbought': curr_rsi > 70,
+        'valid': True,
+    }
+
+
+def check_technical_filter(closes: List[float]) -> Dict[str, Any]:
+    """
+    기술적 사전 필터 (AI 호출 전 체크)
+    
+    MACD + RSI 복합 조건 확인
+    
+    Args:
+        closes: 종가 리스트 (최소 30개 권장)
+    
+    Returns:
+        dict: 매수/매도 신호, 점수, 사유
+    """
+    macd = calculate_macd_signal(closes)
+    rsi = calculate_rsi_crossover(closes)
+    
+    if not macd['valid'] or not rsi['valid']:
+        return {
+            'buy_signal': False,
+            'sell_signal': False,
+            'score_bonus': 0,
+            'reasons': [],
+            'macd': macd,
+            'rsi': rsi,
+        }
+    
+    reasons = []
+    score_bonus = 0
+    
+    # 매수 조건
+    buy_conditions = []
+    
+    # MACD 조건 (골든크로스 또는 MACD > Signal)
+    if macd['golden_cross']:
+        buy_conditions.append(True)
+        reasons.append("MACD골든크로스")
+        score_bonus += 15
+    elif macd['macd_above'] and macd['histogram'] > 0:
+        buy_conditions.append(True)
+        reasons.append("MACD양호")
+        score_bonus += 5
+    else:
+        buy_conditions.append(False)
+    
+    # RSI 조건 (30 상향돌파 또는 30~50 구간)
+    if rsi['upward_cross_30']:
+        buy_conditions.append(True)
+        reasons.append("RSI30돌파")
+        score_bonus += 10
+    elif 30 < rsi['rsi_value'] < 50:
+        buy_conditions.append(True)
+        reasons.append(f"RSI{rsi['rsi_value']:.0f}")
+        score_bonus += 3
+    else:
+        buy_conditions.append(False)
+    
+    # 매도 조건
+    sell_conditions = []
+    
+    if macd['dead_cross']:
+        sell_conditions.append(True)
+        reasons.append("MACD데드크로스")
+    
+    if rsi['downward_cross_70']:
+        sell_conditions.append(True)
+        reasons.append("RSI70이탈")
+    elif rsi['is_overbought']:
+        sell_conditions.append(True)
+        reasons.append("RSI과매수")
+    
+    # AND 조건: 두 조건 모두 충족
+    buy_signal = all(buy_conditions) and len(buy_conditions) >= 2
+    sell_signal = any(sell_conditions)
+    
+    return {
+        'buy_signal': buy_signal,
+        'sell_signal': sell_signal,
+        'score_bonus': score_bonus if buy_signal else 0,
+        'reasons': reasons,
+        'macd': macd,
+        'rsi': rsi,
+    }
+
+
+# =============================================================================
 # 테스트
 # =============================================================================
 

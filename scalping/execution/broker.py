@@ -227,6 +227,7 @@ class KISBroker:
                 - account_code: 상품코드 (보통 01)
                 - base_url: API 서버 URL
                 - environment: 환경 (P: 실전, V: 모의)
+                - hts_id: HTS 사용자 ID (조건검색용)
             dry_run: True면 실제 주문 없이 시뮬레이션
         """
         self.config = config
@@ -242,6 +243,7 @@ class KISBroker:
             'https://openapi.koreainvestment.com:9443'
         )
         self.environment = config.get('environment', 'P')  # P: 실전, V: 모의
+        self.hts_id = config.get('hts_id', '')  # 조건검색용 HTS ID
         
         # 토큰 관리
         self._token: Optional[str] = None
@@ -1608,6 +1610,39 @@ class KISBroker:
         
         # 3. 조건식 결과 조회
         return self.get_condition_result(hts_id, target_seq, limit)
+    
+    def get_condition_stocks(
+        self,
+        condition_name: str = "TV100",
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """
+        조건검색 결과 조회 (간편 버전)
+        
+        내부적으로 저장된 hts_id를 사용합니다.
+        
+        Args:
+            condition_name: 조건식 이름 (기본: TV100)
+            limit: 최대 조회 개수
+        
+        Returns:
+            [{"code": "005930", "name": "삼성전자", "price": 82000, "market": "KOSPI"}, ...]
+        """
+        if not self.hts_id:
+            logger.error("HTS ID가 설정되지 않았습니다 (secrets.yaml 확인)")
+            return []
+        
+        stocks = self.get_condition_universe(self.hts_id, condition_name, limit)
+        
+        # 현재가 추가
+        for stock in stocks:
+            try:
+                price = self.get_current_price(stock['code'])
+                stock['price'] = price
+            except:
+                stock['price'] = 0
+        
+        return stocks
     
     def health_check(self) -> bool:
         """

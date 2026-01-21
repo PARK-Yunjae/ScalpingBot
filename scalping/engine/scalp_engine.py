@@ -503,6 +503,9 @@ class ScalpEngine:
         
         loop_start = time.time()
         
+        # 0. 유니버스 갱신 체크 (10분마다)
+        self._check_universe_refresh()
+        
         # 1. 시장 상태 확인
         market_state = self.market_monitor.get_state()
         
@@ -529,6 +532,90 @@ class ScalpEngine:
         sleep_time = max(0, SCAN_INTERVAL - elapsed)
         time.sleep(sleep_time)
     
+    def _check_universe_refresh(self):
+        """장중 유니버스 갱신 (TV100)"""
+        universe_config = self.config.get('universe', {})
+        
+        if not universe_config.get('refresh_enabled', True):
+            return
+        
+        refresh_interval = universe_config.get('refresh_interval_minutes', 10)
+        now = datetime.now()
+        
+        # 마지막 갱신 시간 체크
+        if not hasattr(self, '_last_universe_refresh'):
+            self._last_universe_refresh = now
+            return
+        
+        minutes_since_refresh = (now - self._last_universe_refresh).total_seconds() / 60
+        
+        if minutes_since_refresh < refresh_interval:
+            return
+        
+        logger.info(f"🔄 유니버스 갱신 시작 ({refresh_interval}분 경과)")
+        
+        try:
+            # TV100 조건검색 호출
+            condition_name = universe_config.get('condition_name', 'TV100')
+            new_stocks = self.broker.get_condition_stocks(condition_name)
+            
+            if not new_stocks:
+                logger.warning("TV100 결과 없음")
+                self._last_universe_refresh = now
+                return
+            
+            # 가격 필터링
+            min_price = universe_config.get('min_price', 3000)
+            max_price = universe_config.get('max_price', 50000)
+            
+            added_count = 0
+            for stock in new_stocks[:20]:  # 상위 20개만
+                code = stock.get('code', '')
+                price = stock.get('price', 0)
+                name = stock.get('name', '')
+                
+                # 가격 필터
+                if not (min_price <= price <= max_price):
+                    continue
+                
+                # 이미 있으면 스킵
+                if code in self._trackers:
+                    continue
+                
+                # 새 종목 추가
+                self._trackers[code] = StockTracker(
+                    code=code,
+                    name=name,
+                    prev_close=price,  # 현재가를 기준으로
+                    ai_score=50,  # 기본 점수
+                    scenarios={},
+                )
+                added_count += 1
+                logger.info(f"   + 추가: {name}({code}) {price:,}원")
+            
+            # 너무 많으면 오래된 것 제거 (최대 20개 유지)
+            max_universe = 20
+            if len(self._trackers) > max_universe:
+                # 보유 중인 종목은 유지
+                holding_codes = set(self.position_manager.get_all_codes())
+                
+                # 보유 중이 아닌 종목 중 오래된 것 제거
+                removable = [
+                    code for code in self._trackers.keys()
+                    if code not in holding_codes
+                ]
+                
+                while len(self._trackers) > max_universe and removable:
+                    old_code = removable.pop(0)
+                    del self._trackers[old_code]
+            
+            self._last_universe_refresh = now
+            logger.info(f"✅ 유니버스 갱신 완료: +{added_count}개, 총 {len(self._trackers)}개")
+            
+        except Exception as e:
+            logger.error(f"유니버스 갱신 실패: {e}")
+            self._last_universe_refresh = now
+    
     def _scan_for_entry(self, market_state):
         """진입 기회 스캔"""
         self._stats['scans'] += 1
@@ -553,19 +640,28 @@ class ScalpEngine:
             if not self.cooldown_tracker.can_buy(code):
                 continue
             
-            # 분봉 데이터 업데이트
-            minute_data = self.broker.get_minute_ohlcv(code, interval=1, count=1)
-            if not minute_data:
+            # 분봉 데이터 업데이트 (기술적 필터용으로 30개)
+            minute_data = self.broker.get_minute_ohlcv(code, interval=1, count=30)
+            if not minute_data or len(minute_data) < 20:
                 continue
             
-            # OHLCV 변환
+            # 🆕 기술적 사전 필터 (MACD + RSI)
+            closes = [float(d.get('close', 0)) for d in minute_data]
+            tech_filter = self._check_technical_filter(closes)
+            
+            if not tech_filter['buy_signal']:
+                # 기술적 조건 미충족 → 스킵 (API 호출 절감)
+                continue
+            
+            # OHLCV 변환 (최신 봉)
+            latest = minute_data[0]
             candle = OHLCV(
-                timestamp=minute_data[0].get('timestamp', ''),
-                open=float(minute_data[0].get('open', 0)),
-                high=float(minute_data[0].get('high', 0)),
-                low=float(minute_data[0].get('low', 0)),
-                close=float(minute_data[0].get('close', 0)),
-                volume=int(minute_data[0].get('volume', 0)),
+                timestamp=latest.get('timestamp', ''),
+                open=float(latest.get('open', 0)),
+                high=float(latest.get('high', 0)),
+                low=float(latest.get('low', 0)),
+                close=float(latest.get('close', 0)),
+                volume=int(latest.get('volume', 0)),
             )
             
             # 지표 업데이트
@@ -582,6 +678,11 @@ class ScalpEngine:
                 stock_name=tracker.name,
             )
             
+            # 🆕 기술적 필터 보너스 점수 추가
+            signal.score += tech_filter['score_bonus']
+            if tech_filter['reasons']:
+                signal.reason += f" | {', '.join(tech_filter['reasons'])}"
+            
             self._stats['signals'] += 1
             
             # BUY 시그널이면서 점수가 높으면 선택
@@ -593,6 +694,20 @@ class ScalpEngine:
         # 최고 시그널로 매수
         if best_signal and best_signal.action == 'BUY':
             self._execute_buy(best_signal)
+    
+    def _check_technical_filter(self, closes: list) -> dict:
+        """기술적 사전 필터 (MACD + RSI)"""
+        try:
+            from scalping.strategy.minute_indicators import check_technical_filter
+            return check_technical_filter(closes)
+        except Exception as e:
+            logger.debug(f"기술적 필터 에러: {e}")
+            # 에러 시 통과 (기존 로직 유지)
+            return {
+                'buy_signal': True,
+                'score_bonus': 0,
+                'reasons': [],
+            }
     
     def _check_positions(self):
         """포지션 체크 (손절/익절/시간손절)"""
