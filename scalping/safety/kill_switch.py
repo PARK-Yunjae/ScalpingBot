@@ -353,12 +353,97 @@ class KillSwitch:
         self.record_trade(is_win=True, stock_code=stock_code)
     
     def _trigger_consecutive_loss(self):
-        """연속 손절 트리거"""
+        """연속 손절 트리거 → 프로그램 종료"""
+        import sys
+        import os
+        from pathlib import Path
+        
+        consecutive = self._status.consecutive_losses
+        
+        # 상세 로그 저장
+        self._save_stop_log(
+            reason=f"연속 손절 {consecutive}회",
+            details=self._get_stop_details()
+        )
+        
+        # 비상 정지 트리거
         self.trigger(
             reason=StopReason.CONSECUTIVE_LOSSES,
-            message=f"연속 손절 {self._status.consecutive_losses}회",
-            execute_liquidation=False  # 연속 손절은 청산하지 않음
+            message=f"연속 손절 {consecutive}회 → 프로그램 종료",
+            execute_liquidation=False
         )
+        
+        # Discord 알림
+        if self.notifier:
+            self.notifier.send_emergency_alert(
+                message=f"🛑 연속 손절 {consecutive}회 - 프로그램 종료",
+                details=self._get_stop_details()
+            )
+        
+        logger.critical("=" * 60)
+        logger.critical(f"🛑 연속 손절 {consecutive}회 - 프로그램 종료")
+        logger.critical("=" * 60)
+        
+        # 프로그램 종료
+        sys.exit(1)
+    
+    def _save_stop_log(self, reason: str, details: str):
+        """
+        정지 사유 로그 파일 저장
+        
+        logs/stop_YYYYMMDD_HHMMSS.log 형식으로 저장
+        """
+        from pathlib import Path
+        
+        try:
+            log_dir = Path("logs")
+            log_dir.mkdir(exist_ok=True)
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_file = log_dir / f"stop_{timestamp}.log"
+            
+            content = [
+                "=" * 60,
+                f"ScalpingBot 정지 로그",
+                f"시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                "=" * 60,
+                "",
+                f"정지 사유: {reason}",
+                "",
+                "상세 내용:",
+                "-" * 40,
+                details,
+                "",
+                "=" * 60,
+            ]
+            
+            with open(log_file, 'w', encoding='utf-8') as f:
+                f.write("\n".join(content))
+            
+            logger.info(f"정지 로그 저장: {log_file}")
+            
+        except Exception as e:
+            logger.error(f"정지 로그 저장 실패: {e}")
+    
+    def _get_stop_details(self) -> str:
+        """정지 상세 정보"""
+        status = self._status
+        
+        lines = [
+            f"연속 손절: {status.consecutive_losses}회",
+            f"오늘 총 거래: {status.total_trades_today}회",
+            f"오늘 손실 횟수: {status.losses_today}회",
+            f"일일 손익률: {status.daily_loss_pct:+.2f}%",
+            f"코스피 등락률: {status.kospi_change:+.2f}%",
+            f"시장 모드: {status.market_mode}",
+            "",
+            "종목별 손절 횟수:",
+        ]
+        
+        for code, count in self._stock_losses.items():
+            lines.append(f"  - {code}: {count}회")
+        
+        return "\n".join(lines)
     
     # =========================================================================
     # 일일 손실 추적

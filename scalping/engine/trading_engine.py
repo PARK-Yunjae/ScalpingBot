@@ -36,6 +36,7 @@ import time
 import logging
 import threading
 import schedule
+import pandas as pd
 from typing import Dict, List, Optional, Any, Callable
 from datetime import datetime, timedelta
 from dataclasses import dataclass
@@ -48,6 +49,7 @@ from scalping.execution.position_manager import PositionManager, SellReason
 from scalping.execution.cooldown_tracker import CooldownTracker
 from scalping.execution.price_validator import PriceValidator
 from scalping.data.market_monitor import MarketMonitor, MarketMode
+from scalping.data.universe_filter import UniverseFilter
 from scalping.strategy.score_engine import ScoreEngine
 from scalping.strategy.indicators import calculate_all_indicators
 from scalping.ai.ai_engine import AIEngine
@@ -66,12 +68,18 @@ logger = logging.getLogger('ScalpingBot.Engine')
 # 스캔 간격
 SCAN_INTERVAL_SECONDS = 60       # 종목 스캔 간격 (1분)
 POSITION_CHECK_SECONDS = 1       # 포지션 체크 간격 (1초)
+POSITION_STATUS_INTERVAL = 300   # 포지션 현황 알림 간격 (5분)
 
 # 장 시간
 MARKET_PREP_TIME = "08:55"      # 준비 시작
-MARKET_OPEN_TIME = "09:00"      # 장 시작
+MARKET_OPEN_TIME = "09:05"      # 장 시작 (장초 변동성 회피)
 MARKET_CLOSE_TIME = "15:20"     # 장 마감 (청산 시작)
 MARKET_END_TIME = "15:30"       # 완전 종료
+
+# 점심시간 (거래량 급감, 스프레드 확대 → 관망)
+LUNCH_PREP_TIME = "11:25"       # 점심 청산 시작 (5분 여유)
+LUNCH_START_TIME = "11:30"      # 점심 시작
+LUNCH_END_TIME = "13:00"        # 점심 종료
 
 # 점수 임계값
 MIN_SCORE_NORMAL = 65           # 정상 모드 최소 점수
@@ -149,12 +157,26 @@ class TradingEngine:
             config.get('risk', {}).get('position_size', 500000)
         )
         
+        # 🆕 LIVE_MICRO 모드: 종목당 최대 10만원 제한
+        self.mode = config.get('mode', 'LIVE_DATA_ONLY')
+        if self.mode == 'LIVE_MICRO':
+            self.position_size = min(self.position_size, 100000)
+            logger.info(f"🔸 LIVE_MICRO 모드: 종목당 최대 {self.position_size:,}원 제한")
+        
+        # 🆕 min_score: config에서 읽기 (기본값: 65, 보수적: +10)
+        self.min_score_normal = config.get('trading', {}).get('min_score', MIN_SCORE_NORMAL)
+        self.min_score_conservative = self.min_score_normal + 10  # 보수적 모드는 +10
+        
+        # 🆕 min_ai_confidence: config에서 읽기
+        self.min_ai_confidence = config.get('ai', {}).get('min_confidence', MIN_AI_CONFIDENCE)
+        
         # 구성요소 (초기화 전)
         self.broker: Optional[KISBroker] = None
         self.position_manager: Optional[PositionManager] = None
         self.cooldown_tracker: Optional[CooldownTracker] = None
         self.price_validator: Optional[PriceValidator] = None
         self.market_monitor: Optional[MarketMonitor] = None
+        self.universe_filter: Optional[UniverseFilter] = None
         self.score_engine: Optional[ScoreEngine] = None
         self.ai_engine: Optional[AIEngine] = None
         self.learning_store: Optional[LearningStore] = None
@@ -163,6 +185,8 @@ class TradingEngine:
         
         # 유니버스 (매매 대상 종목)
         self.universe: List[Dict] = []
+        self._universe_last_update: float = 0  # 마지막 갱신 시간
+        self._universe_refresh_interval: float = 300  # 5분마다 갱신
         
         # 일봉 캐시 (종목코드 -> 점수)
         self._daily_score_cache: Dict[str, float] = {}
@@ -172,6 +196,7 @@ class TradingEngine:
         self._scan_thread: Optional[threading.Thread] = None
         self._position_thread: Optional[threading.Thread] = None
         self._engine_thread: Optional[threading.Thread] = None  # start() 메서드용
+        self._order_lock = threading.Lock()  # 🆕 주문 동시성 제어 (중복 주문 방지)
         
         # 통계
         self._stats = {
@@ -266,8 +291,8 @@ class TradingEngine:
             # 7. AI 엔진
             logger.info("7. AI 엔진 초기화...")
             ai_config = self.config.get('ai', {})
-            # AIEngine은 config dict를 받음
-            self.ai_engine = AIEngine(config=ai_config)
+            # 🆕 AIEngine에 secrets도 전달 (Gemini API 키 등)
+            self.ai_engine = AIEngine(config=ai_config, secrets=self.secrets)
             logger.info("   ✅ AI 엔진 초기화 완료")
             
             # 8. 학습 저장소
@@ -437,6 +462,9 @@ class TradingEngine:
         """메인 트레이딩 루프"""
         last_scan_time = 0
         last_position_check = 0
+        last_position_status = 0  # 🆕 포지션 현황 알림 시간
+        lunch_liquidated = False  # 점심 청산 완료 플래그
+        daily_report_sent = False  # 🆕 일일 리포트 전송 플래그
         
         while self._running:
             try:
@@ -448,20 +476,38 @@ class TradingEngine:
                     logger.warning("🛑 Kill Switch 활성화, 루프 중지")
                     break
                 
-               # 장 운영 시간 체크
+                # 장 운영 시간 체크
                 if not self._is_trading_time():
-                    # 장 마감 체크 (15:20~15:30)
+                    # 장 마감 체크
                     if self._is_closing_time():
                         self._handle_market_close()
                     
-                    # 장 종료 후 자동 종료 (15:30 이후)
-                    current_str = datetime.now().strftime("%H:%M")
-                    if current_str > "15:30":
-                        logger.info("📴 장 종료 - 프로그램 자동 종료")
-                        break
+                    # 🆕 장 종료 후 일일 리포트 (15:35 이후, 한 번만)
+                    if self._is_after_market_close() and not daily_report_sent:
+                        self._handle_daily_close()
+                        daily_report_sent = True
+                        logger.info("📊 장 종료 후 일일 리포트 전송 완료")
                     
                     time.sleep(10)
                     continue
+                
+                # 🆕 장 시작 시 플래그 리셋 (09:05)
+                if current_time.strftime("%H:%M") == MARKET_OPEN_TIME:
+                    daily_report_sent = False
+                
+                # 🍽️ 점심 청산 체크 (11:25~11:30)
+                if self._is_lunch_prep_time() and not lunch_liquidated:
+                    self._liquidate_for_lunch()
+                    lunch_liquidated = True
+                
+                # 🍽️ 점심시간 관망 (11:30~13:00)
+                if self._is_lunch_time():
+                    time.sleep(30)  # 30초 대기
+                    continue
+                
+                # 오후장 시작 시 플래그 리셋
+                if current_time.strftime("%H:%M") >= LUNCH_END_TIME:
+                    lunch_liquidated = False
                 
                 # 1. 포지션 체크 (1초마다)
                 if now - last_position_check >= POSITION_CHECK_SECONDS:
@@ -475,6 +521,11 @@ class TradingEngine:
                 
                 # 3. AI 응답 처리
                 self._process_ai_results()
+                
+                # 🆕 4. 포지션 현황 알림 (5분마다, 포지션 있을 때만)
+                if now - last_position_status >= POSITION_STATUS_INTERVAL:
+                    self._send_position_status()
+                    last_position_status = now
                 
                 # 짧은 대기
                 time.sleep(0.1)
@@ -533,6 +584,126 @@ class TradingEngine:
         
         return MARKET_CLOSE_TIME <= current_str <= MARKET_END_TIME
     
+    def _is_lunch_time(self) -> bool:
+        """점심시간 여부 (11:30~13:00)"""
+        now = datetime.now()
+        current_str = now.strftime("%H:%M")
+        
+        return LUNCH_START_TIME <= current_str < LUNCH_END_TIME
+    
+    def _is_lunch_prep_time(self) -> bool:
+        """점심 청산 시간 여부 (11:25~11:30)"""
+        now = datetime.now()
+        current_str = now.strftime("%H:%M")
+        
+        return LUNCH_PREP_TIME <= current_str < LUNCH_START_TIME
+    
+    def _is_after_market_close(self) -> bool:
+        """장 종료 후 리포트 시간 여부 (15:35~16:00)"""
+        now = datetime.now()
+        
+        # 주말 제외
+        if now.weekday() >= 5:
+            return False
+        
+        current_str = now.strftime("%H:%M")
+        
+        return "15:35" <= current_str <= "16:00"
+    
+    def _liquidate_for_lunch(self):
+        """점심시간 전 보유 종목 청산"""
+        positions = self.position_manager.get_all_positions()
+        
+        if not positions:
+            # 포지션 없어도 중간 리포트는 발송
+            self._send_morning_report()
+            return
+        
+        logger.info(f"🍽️ 점심 청산 시작 ({len(positions)}종목)")
+        
+        for pos in positions:
+            # 현재가 조회
+            current_price = self.broker.get_current_price(pos.stock_code)
+            if current_price <= 0:
+                current_price = pos.entry_price  # fallback
+            
+            self._execute_sell(
+                stock_code=pos.stock_code,
+                quantity=pos.quantity,
+                reason=SellReason.LUNCH_BREAK,
+                current_price=current_price,
+            )
+        
+        # 🆕 오전장 중간 리포트 발송
+        self._send_morning_report()
+        
+        if self.notifier:
+            self.notifier.send_info(f"🍽️ 점심 청산 완료 ({len(positions)}종목) - 13:00까지 관망")
+    
+    def _send_morning_report(self):
+        """오전장 중간 리포트 발송"""
+        logger.info("=" * 60)
+        logger.info("🍽️ 오전장 중간 리포트")
+        logger.info("=" * 60)
+        
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        
+        total_trades = len(self._today_trades)
+        buy_trades = [t for t in self._today_trades if t['side'] == 'BUY']
+        sell_trades = [t for t in self._today_trades if t['side'] == 'SELL']
+        
+        wins = len([t for t in sell_trades if t.get('profit_pct', 0) > 0])
+        losses = len([t for t in sell_trades if t.get('profit_pct', 0) <= 0])
+        
+        total_profit_pct = sum(t.get('profit_pct', 0) for t in sell_trades)
+        
+        # 상세 로그
+        logger.info(f"📅 날짜: {today_str} (오전장)")
+        logger.info(f"📈 총 매매: {total_trades}건 (매수 {len(buy_trades)}건, 매도 {len(sell_trades)}건)")
+        if (wins + losses) > 0:
+            logger.info(f"🎯 승률: {wins}승 {losses}패 ({wins/(wins+losses)*100:.1f}%)")
+        else:
+            logger.info("🎯 승률: -")
+        logger.info(f"💰 오전 수익률: {total_profit_pct:+.2f}%")
+        
+        # 개별 매매 상세
+        if sell_trades:
+            logger.info("-" * 40)
+            for i, trade in enumerate(sell_trades, 1):
+                emoji = "🟢" if trade.get('profit_pct', 0) >= 0 else "🔴"
+                logger.info(
+                    f"   {i}. {emoji} {trade.get('stock_code', 'N/A')} "
+                    f"{trade.get('profit_pct', 0):+.2f}% ({trade.get('reason', 'N/A')})"
+                )
+        
+        logger.info("=" * 60)
+        
+        # Discord 알림
+        if self.notifier:
+            # 최고/최저 매매
+            best_trade = None
+            worst_trade = None
+            if sell_trades:
+                best = max(sell_trades, key=lambda x: x.get('profit_pct', 0))
+                worst = min(sell_trades, key=lambda x: x.get('profit_pct', 0))
+                best_trade = {'name': best['stock_code'], 'profit': best.get('profit_pct', 0)}
+                worst_trade = {'name': worst['stock_code'], 'profit': worst.get('profit_pct', 0)}
+            
+            self.notifier.send_daily_report(
+                date=f"{today_str} (오전장)",
+                total_trades=total_trades,
+                wins=wins,
+                losses=losses,
+                total_profit=total_profit_pct * 10000,
+                total_profit_pct=total_profit_pct,
+                best_trade=best_trade,
+                worst_trade=worst_trade,
+                ai_stats={
+                    'total': self._stats['total_ai_requests'],
+                    'avg_confidence': 0.7,
+                }
+            )
+    
     # =========================================================================
     # 유니버스 스캔
     # =========================================================================
@@ -560,14 +731,18 @@ class TradingEngine:
             logger.info("🚨 비상 모드 - 스캔 스킵")
             return
         elif market_mode == MarketMode.CONSERVATIVE:
-            min_score = MIN_SCORE_CONSERVATIVE
+            min_score = self.min_score_conservative  # 🆕 config에서 읽은 값 사용
         else:
-            min_score = MIN_SCORE_NORMAL
+            min_score = self.min_score_normal  # 🆕 config에서 읽은 값 사용
         
-        # 유니버스 가져오기 (TODO: 실제 구현에서는 거래대금 상위 종목 조회)
-        # 현재는 테스트용 더미 데이터
-        if not self.universe:
+        # 유니버스 가져오기 (5분마다 갱신)
+        should_refresh = (
+            not self.universe or 
+            (time.time() - self._universe_last_update) > self._universe_refresh_interval
+        )
+        if should_refresh:
             self._build_universe()
+            self._universe_last_update = time.time()
         
         # 스캔 결과
         candidates = []
@@ -587,13 +762,14 @@ class TradingEngine:
             if self.position_manager.get_position_count() >= self.max_positions:
                 break
             
-            # 점수 계산 (캐시 활용)
-            score = self._calculate_score(stock)
+            # 점수 및 지표 계산 (캐시 활용)
+            score, indicators = self._calculate_score(stock)
             
             if score >= min_score:
                 candidates.append({
                     'stock': stock,
                     'score': score,
+                    'indicators': indicators,  # 🆕 지표 추가
                     'market_mode': market_mode.value,
                 })
         
@@ -606,34 +782,139 @@ class TradingEngine:
         )
     
     def _build_universe(self):
-        """유니버스 구성 (테스트용)"""
-        # TODO: 실제 구현에서는 거래대금 상위 종목 조회
-        self.universe = [
-            {'code': '005930', 'name': '삼성전자'},
-            {'code': '000660', 'name': 'SK하이닉스'},
-            {'code': '035720', 'name': '카카오'},
-            {'code': '005380', 'name': '현대차'},
-            {'code': '000270', 'name': '기아'},
-        ]
+        """유니버스 구성 (조건검색 또는 KRX 기반)"""
+        # hts_id 가져오기
+        hts_id = self.secrets.get('kis', {}).get('hts_id', '')
         
-        logger.info(f"유니버스 구성: {len(self.universe)}개 종목")
+        # 조건식 이름 (config에서 가져오거나 기본값)
+        condition_name = self.config.get('universe', {}).get('condition_name', 'TV100')
+        target_size = self.config.get('universe', {}).get('target_size', 100)
+        
+        # 갱신인지 초기화인지 로깅
+        is_refresh = len(self.universe) > 0
+        action = "갱신" if is_refresh else "초기화"
+        
+        # UniverseFilter가 없으면 생성
+        if self.universe_filter is None:
+            self.universe_filter = UniverseFilter(
+                broker=self.broker,
+                hts_id=hts_id if hts_id else None,
+                target_size=target_size,
+                min_price=self.config.get('universe', {}).get('min_price', 5000),
+                max_price=self.config.get('universe', {}).get('max_price', 500000),
+                min_volume=self.config.get('universe', {}).get('min_volume', 100000),
+            )
+        
+        # 유니버스 조회 (갱신 시 캐시 무시)
+        try:
+            stocks = self.universe_filter.get_universe_with_info(
+                condition_name=condition_name,
+                target_size=target_size,
+                use_cache=not is_refresh,  # 갱신 시 캐시 무시
+            )
+            
+            # 내부 형식으로 변환
+            self.universe = [
+                {'code': s.stock_code, 'name': s.stock_name, 'market': s.market}
+                for s in stocks
+            ]
+            
+            # 데이터 소스 로깅
+            source = self.universe_filter._stats.get('source', '알 수 없음')
+            logger.info(f"유니버스 {action}: {len(self.universe)}개 종목 (소스: {source})")
+            
+        except Exception as e:
+            logger.error(f"유니버스 구성 실패: {e}")
+            # 실패 시 기본 종목 (삼성전자 등)
+            self.universe = [
+                {'code': '005930', 'name': '삼성전자', 'market': 'KOSPI'},
+                {'code': '000660', 'name': 'SK하이닉스', 'market': 'KOSPI'},
+            ]
+            logger.warning(f"기본 유니버스 사용: {len(self.universe)}개 종목")
     
-    def _calculate_score(self, stock: Dict) -> float:
-        """종목 점수 계산"""
+    def _calculate_score(self, stock: Dict) -> tuple:
+        """
+        종목 점수 및 지표 계산
+        
+        Returns:
+            (score, indicators) 튜플
+            - score: 0~100 점수
+            - indicators: AI에 전달할 지표 딕셔너리
+        """
         stock_code = stock['code']
         
-        # 캐시 확인
+        # 캐시 확인 (점수 + 지표 함께 캐시)
         if stock_code in self._daily_score_cache:
-            return self._daily_score_cache[stock_code]
+            cached = self._daily_score_cache[stock_code]
+            if isinstance(cached, dict):
+                return cached.get('score', 0), cached.get('indicators', {})
+            else:
+                # 이전 캐시 형식 (점수만) - 재계산
+                pass
         
-        # TODO: 실제 구현에서는 일봉/분봉 데이터로 점수 계산
-        # 테스트용 더미 점수
-        import random
-        score = random.uniform(50, 90)
-        
-        self._daily_score_cache[stock_code] = score
-        
-        return score
+        try:
+            # 1. 일봉 데이터 가져오기 (최근 30일)
+            ohlcv_list = self.broker.get_daily_ohlcv(stock_code, period=30)
+            
+            if ohlcv_list is None or len(ohlcv_list) < 20:
+                logger.debug(f"일봉 데이터 부족: {stock_code}")
+                return 0, {}
+            
+            # 🆕 List[Dict] → DataFrame 변환
+            ohlcv_df = pd.DataFrame(ohlcv_list)
+            
+            # 컬럼명 매핑 (broker 반환 형식 → indicators 기대 형식)
+            # broker: date, open, high, low, close, volume, change_pct
+            # 이미 맞는 형식이므로 그대로 사용
+            
+            # 2. 지표 계산
+            df_with_indicators = calculate_all_indicators(ohlcv_df)
+            
+            # 3. 최신 행의 지표 추출
+            latest = df_with_indicators.iloc[-1]
+            
+            indicators = {
+                'cci': float(latest.get('cci', 0)) if not pd.isna(latest.get('cci')) else 0,
+                'change_pct': float(latest.get('change_pct', 0)) if not pd.isna(latest.get('change_pct')) else 0,
+                'distance_ma20': float(latest.get('distance_ma20', 0)) if not pd.isna(latest.get('distance_ma20')) else 0,
+                'volume_ratio': float(latest.get('volume_ratio', 1.0)) if not pd.isna(latest.get('volume_ratio')) else 1.0,
+                'consec_bullish': int(latest.get('consec_bullish', 0)) if not pd.isna(latest.get('consec_bullish')) else 0,
+                'upper_wick_ratio': float(latest.get('upper_wick_ratio', 0)) if not pd.isna(latest.get('upper_wick_ratio')) else 0,
+                'ma20_3day_up': bool(latest.get('ma20_3day_up', False)),
+                'high_eq_close': bool(latest.get('high_eq_close', False)),
+            }
+            
+            # 4. ScoreEngine으로 점수 계산
+            score_result = self.score_engine.calculate_total_score(indicators)
+            score = score_result.total_score
+            
+            # 점수 상세 정보도 지표에 추가 (디버깅/로깅용)
+            indicators['score_detail'] = {
+                'cci_score': score_result.cci_score,
+                'change_score': score_result.change_score,
+                'distance_score': score_result.distance_score,
+                'volume_score': score_result.volume_score,
+                'candle_score': score_result.candle_score,
+            }
+            
+            # 5. 캐시에 저장
+            self._daily_score_cache[stock_code] = {
+                'score': score,
+                'indicators': indicators,
+                'timestamp': time.time(),
+            }
+            
+            logger.debug(
+                f"📊 {stock_code}: 점수={score:.1f}, "
+                f"CCI={indicators['cci']:.1f}, 등락={indicators['change_pct']:.2f}%, "
+                f"거래량={indicators['volume_ratio']:.2f}x"
+            )
+            
+            return score, indicators
+            
+        except Exception as e:
+            logger.warning(f"점수 계산 실패 {stock_code}: {e}")
+            return 0, {}
     
     # =========================================================================
     # AI 분석
@@ -643,33 +924,64 @@ class TradingEngine:
         """AI 분석 요청"""
         stock = candidate['stock']
         score = candidate['score']
+        indicators = candidate.get('indicators', {})  # 🆕 실제 지표 사용
         market_mode = candidate['market_mode']
         
         # 현재가 조회
         current_price = self.broker.get_current_price(stock['code'])
         
-        # 과거 승률 조회
-        pattern_stats = self.learning_store.get_pattern_stats(
-            cci_range=(150, 180),  # TODO: 실제 CCI 값 사용
-            score_range=(int(score) // 10 * 10, int(score) // 10 * 10 + 10),
-        )
+        # 🆕 가격 필터링: position_size로 1주도 못 사면 스킵
+        if current_price > self.position_size:
+            logger.debug(
+                f"💰 가격 필터링: {stock['code']} {stock['name']} "
+                f"({current_price:,}원 > {self.position_size:,}원)"
+            )
+            return
         
-        # AI 분석 요청
+        # 과거 승률 조회 (인자 없이 호출)
+        pattern_stats = self.learning_store.get_pattern_stats()
+        # 점수 구간별 승률 추출 (high/medium/low)
+        score_zone = 'high' if score >= 80 else ('medium' if score >= 70 else 'low')
+        zone_stats = pattern_stats.get('score_stats', {}).get(score_zone, {})
+        past_winrate = zone_stats.get('winrate', 50)
+        
+        # AI 분석 요청 (AIEngine 시그니처에 맞게 딕셔너리로 전달)
+        market_state_obj = self.market_monitor.get_state()
+        
+        # 🆕 실제 지표 사용 (더미값 제거!)
+        ai_indicators = {
+            'cci': indicators.get('cci', 0),
+            'change_pct': indicators.get('change_pct', 0),
+            'distance_ma20': indicators.get('distance_ma20', 0),
+            'volume_ratio': indicators.get('volume_ratio', 1.0),
+            'consec_bullish': indicators.get('consec_bullish', 0),
+            'candle_score': sum([
+                indicators.get('score_detail', {}).get('candle_score', 0)
+            ]) if indicators.get('score_detail') else 0,
+            'past_winrate': past_winrate,
+        }
+        
         request_id = self.ai_engine.request_analysis(
             stock_code=stock['code'],
             stock_name=stock['name'],
+            indicators=ai_indicators,
             rule_score=score,
-            cci=160,  # TODO: 실제 CCI 값
-            change_pct=3.0,  # TODO: 실제 등락률
-            volume_ratio=2.0,  # TODO: 실제 거래량 비율
-            market_mode=market_mode,
-            market_change=self.market_monitor.get_state().kospi_change,
-            past_winrate=pattern_stats.get('winrate', 50),
+            market_state={
+                'mode': market_mode,
+                'change': market_state_obj.kospi_change if market_state_obj else 0,
+                'above_ma20': market_state_obj.above_ma20 if market_state_obj else True,
+            },
+            current_price=current_price,
         )
         
         self._stats['total_ai_requests'] += 1
         
-        logger.debug(f"AI 분석 요청: {stock['code']} {stock['name']} (점수: {score:.1f})")
+        # 🆕 상세 로깅
+        logger.info(
+            f"🤖 AI 분석 요청: {stock['code']} {stock['name']} | "
+            f"점수={score:.1f}, CCI={ai_indicators['cci']:.1f}, "
+            f"등락={ai_indicators['change_pct']:+.2f}%, 거래량={ai_indicators['volume_ratio']:.2f}x"
+        )
     
     def _process_ai_results(self):
         """AI 응답 처리"""
@@ -680,12 +992,12 @@ class TradingEngine:
                 break
             
             # BUY 결정이고 신뢰도 충족 시
-            if result.decision == 'BUY' and result.confidence >= MIN_AI_CONFIDENCE:
+            if result['decision'] == 'BUY' and result['confidence'] >= self.min_ai_confidence:
                 self._execute_buy(result)
             else:
                 logger.debug(
-                    f"AI 결정 SKIP: {result.stock_code} "
-                    f"({result.decision}, 신뢰도: {result.confidence:.2f})"
+                    f"AI 결정 SKIP: {result['stock_code']} "
+                    f"({result['decision']}, 신뢰도: {result['confidence']:.2f})"
                 )
     
     # =========================================================================
@@ -694,17 +1006,19 @@ class TradingEngine:
     
     def _execute_buy(self, ai_result):
         """매수 실행"""
-        stock_code = ai_result.stock_code
+        stock_code = ai_result['stock_code']
         
-        # 최대 포지션 재확인
-        if self.position_manager.get_position_count() >= self.max_positions:
-            logger.info(f"최대 포지션 도달, 매수 스킵: {stock_code}")
-            return
-        
-        # 이미 보유 중인지 재확인
-        if self.position_manager.has_position(stock_code):
-            logger.info(f"이미 보유 중, 매수 스킵: {stock_code}")
-            return
+        # 🆕 중복 주문 방지 Lock
+        with self._order_lock:
+            # 최대 포지션 재확인
+            if self.position_manager.get_position_count() >= self.max_positions:
+                logger.info(f"최대 포지션 도달, 매수 스킵: {stock_code}")
+                return
+            
+            # 이미 보유 중인지 재확인
+            if self.position_manager.has_position(stock_code):
+                logger.info(f"이미 보유 중, 매수 스킵: {stock_code}")
+                return
         
         # 현재가 조회
         current_price = self.broker.get_current_price(stock_code)
@@ -716,9 +1030,9 @@ class TradingEngine:
         # 가격 검증
         validation = self.price_validator.validate(
             stock_code=stock_code,
-            analysis_price=ai_result.original_price,
+            analysis_price=ai_result['original_price'],
             current_price=current_price,
-            analysis_time=datetime.fromtimestamp(ai_result.timestamp),
+            analysis_time=datetime.fromtimestamp(ai_result['timestamp']),
         )
         
         if not validation.is_valid:
@@ -738,25 +1052,29 @@ class TradingEngine:
         if result.success:
             self._stats['total_buys'] += 1
             
+            # 🆕 CCI 추출
+            entry_cci = ai_result.get('indicators', {}).get('cci', 0)
+            
             # 포지션 등록
             self.position_manager.add_position(
                 stock_code=stock_code,
-                stock_name=ai_result.stock_name or stock_code,
+                stock_name=ai_result.get('stock_name') or stock_code,
                 entry_price=current_price,
                 quantity=quantity,
-                score=ai_result.rule_score,
-                ai_confidence=ai_result.confidence,
+                score=ai_result.get('rule_score', 0),
+                ai_confidence=ai_result['confidence'],
+                entry_cci=entry_cci,  # 🆕
             )
             
             # 알림
             self.notifier.send_buy_signal(
                 stock_code=stock_code,
-                stock_name=ai_result.stock_name or stock_code,
+                stock_name=ai_result.get('stock_name') or stock_code,
                 price=current_price,
                 quantity=quantity,
-                score=ai_result.rule_score,
-                ai_confidence=ai_result.confidence,
-                grade=self._get_grade(ai_result.rule_score),
+                score=ai_result.get('rule_score', 0),
+                ai_confidence=ai_result['confidence'],
+                grade=self._get_grade(ai_result.get('rule_score', 0)),
             )
             
             # 매매 기록
@@ -766,8 +1084,9 @@ class TradingEngine:
                 'side': 'BUY',
                 'price': current_price,
                 'quantity': quantity,
-                'score': ai_result.rule_score,
-                'ai_confidence': ai_result.confidence,
+                'score': ai_result.get('rule_score', 0),
+                'ai_confidence': ai_result['confidence'],
+                'entry_cci': entry_cci,  # 🆕
             })
             
             logger.info(
@@ -824,8 +1143,9 @@ class TradingEngine:
                 decision='BUY',
                 confidence=position.ai_confidence,
                 profit=profit_pct,
+                win=not is_loss,
                 rule_score=position.score,
-                cci=0,  # TODO: 실제 CCI
+                cci=position.entry_cci,  # 🆕 실제 CCI 사용
                 market_mode=self.market_monitor.get_state().mode.value,
             )
             
@@ -857,6 +1177,19 @@ class TradingEngine:
         else:
             logger.error(f"❌ 매도 실패: {stock_code} - {result.error}")
             self.kill_switch.record_api_error()
+            
+            # 🆕 매도 실패 시 포지션 강제 제거 (수량 초과 에러 = 이미 매도됨/HTS 조건매도 등)
+            error_msg = str(result.error).lower()
+            if "수량" in error_msg or "초과" in error_msg or "잔량" in error_msg:
+                logger.warning(f"⚠️ 포지션 강제 제거: {stock_code} (매도 불가 상태 - HTS 조건매도 등)")
+                self.position_manager.remove_position(stock_code)
+                
+                # Discord 알림
+                if self.notifier:
+                    self.notifier.send_warning(
+                        f"⚠️ 포지션 강제 제거: {stock_code}\n"
+                        f"사유: 매도 불가 (수량 초과) - HTS 조건매도 등으로 이미 처리됨"
+                    )
     
     # =========================================================================
     # 포지션 관리
@@ -887,6 +1220,45 @@ class TradingEngine:
                     current_price=current_price,
                 )
     
+    def _send_position_status(self):
+        """포지션 현황 알림 (주기적)"""
+        positions = self.position_manager.get_all_positions()
+        
+        if not positions:
+            # 포지션 없으면 알림 스킵
+            return
+        
+        # 포지션 정보 수집
+        pos_list = []
+        total_profit_pct = 0.0
+        
+        for pos in positions:
+            pos_list.append({
+                'stock_code': pos.stock_code,
+                'stock_name': pos.stock_name,
+                'profit_pct': pos.profit_pct,
+                'quantity': pos.quantity,
+                'current_price': pos.current_price,
+                'entry_price': pos.entry_price,
+                'grade': pos.grade,
+            })
+            total_profit_pct += pos.profit_pct
+        
+        # 평균 수익률 계산
+        avg_profit_pct = total_profit_pct / len(positions) if positions else 0
+        
+        # 로그 출력
+        logger.info(f"📊 포지션 현황: {len(positions)}개 종목, 평균 {avg_profit_pct:+.2f}%")
+        for pos in pos_list:
+            logger.info(f"   - {pos['stock_name']} ({pos['stock_code']}): {pos['profit_pct']:+.2f}%")
+        
+        # Discord 알림
+        if self.notifier:
+            self.notifier.send_position_status(
+                positions=pos_list,
+                total_profit_pct=avg_profit_pct,
+            )
+    
     # =========================================================================
     # 장 마감 처리
     # =========================================================================
@@ -914,7 +1286,9 @@ class TradingEngine:
     
     def _handle_daily_close(self):
         """일일 마감 처리"""
-        logger.info("📊 일일 마감 처리...")
+        logger.info("=" * 60)
+        logger.info("📊 일일 마감 처리 시작")
+        logger.info("=" * 60)
         
         # 일일 통계 계산
         today_str = datetime.now().strftime("%Y-%m-%d")
@@ -939,27 +1313,56 @@ class TradingEngine:
             best_trade = {'name': best['stock_code'], 'profit': best.get('profit_pct', 0)}
             worst_trade = {'name': worst['stock_code'], 'profit': worst.get('profit_pct', 0)}
         
-        # 일일 리포트 전송
-        self.notifier.send_daily_report(
-            date=today_str,
-            total_trades=total_trades,
-            wins=wins,
-            losses=losses,
-            total_profit=total_profit_pct * 10000,  # 임의 환산
-            total_profit_pct=total_profit_pct,
-            best_trade=best_trade,
-            worst_trade=worst_trade,
-            ai_stats={
-                'total': self._stats['total_ai_requests'],
-                'avg_confidence': 0.7,  # TODO: 실제 계산
-            }
-        )
+        # 상세 로그 출력
+        logger.info(f"📅 날짜: {today_str}")
+        logger.info(f"📈 총 매매: {total_trades}건 (매수 {len(buy_trades)}건, 매도 {len(sell_trades)}건)")
+        if (wins + losses) > 0:
+            logger.info(f"🎯 승률: {wins}승 {losses}패 ({wins/(wins+losses)*100:.1f}% 승률)")
+        else:
+            logger.info("🎯 승률: -")
+        logger.info(f"💰 총 수익률: {total_profit_pct:+.2f}%")
+        
+        if best_trade:
+            logger.info(f"🏆 최고 매매: {best_trade['name']} ({best_trade['profit']:+.2f}%)")
+        if worst_trade:
+            logger.info(f"💔 최저 매매: {worst_trade['name']} ({worst_trade['profit']:+.2f}%)")
+        
+        # 개별 매매 상세 로그
+        if sell_trades:
+            logger.info("-" * 40)
+            logger.info("📋 매매 상세:")
+            for i, trade in enumerate(sell_trades, 1):
+                emoji = "🟢" if trade.get('profit_pct', 0) >= 0 else "🔴"
+                logger.info(
+                    f"   {i}. {emoji} {trade.get('stock_code', 'N/A')} "
+                    f"{trade.get('profit_pct', 0):+.2f}% ({trade.get('reason', 'N/A')})"
+                )
+        
+        logger.info("=" * 60)
+        
+        # Discord 알림 (notifier가 있을 때만)
+        if self.notifier:
+            self.notifier.send_daily_report(
+                date=today_str,
+                total_trades=total_trades,
+                wins=wins,
+                losses=losses,
+                total_profit=total_profit_pct * 10000,  # 임의 환산
+                total_profit_pct=total_profit_pct,
+                best_trade=best_trade,
+                worst_trade=worst_trade,
+                ai_stats={
+                    'total': self._stats['total_ai_requests'],
+                    'avg_confidence': 0.7,  # TODO: 실제 계산
+                }
+            )
         
         # 학습 저장소 일일 집계
-        self.learning_store.update_daily_summary()
+        if self.learning_store:
+            self.learning_store.update_daily_summary()
         
         logger.info(
-            f"일일 마감: {total_trades}건 매매, "
+            f"📊 일일 마감 완료: {total_trades}건 매매, "
             f"{wins}승 {losses}패, {total_profit_pct:+.2f}%"
         )
     

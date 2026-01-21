@@ -1,13 +1,12 @@
 @echo off
-chcp 65001 > nul
+cd /d "%~dp0"
 
-echo [%date% %time%] ScalpingBot 시작 >> C:\Coding\ScalpingBot\logs\startup.log
+if exist "venv\Scripts\activate.bat" (
+    call venv\Scripts\activate.bat
+)
 
-cd /d C:\Coding\ScalpingBot
-call venv\Scripts\activate.bat
+if not exist logs mkdir logs
 
-echo [%date% %time%] 가상환경 활성화 >> C:\Coding\ScalpingBot\logs\startup.log
+python -m scalping.engine.scalp_engine
 
-python main.py --mode LIVE_DATA_ONLY --dry-run --debug
-
-echo [%date% %time%] ScalpingBot 종료 >> C:\Coding\ScalpingBot\logs\startup.log
+pause

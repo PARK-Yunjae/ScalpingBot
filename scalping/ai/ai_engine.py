@@ -86,23 +86,40 @@ class AIEngine:
     다음 작업을 계속할 수 있습니다.
     """
     
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, secrets: dict = None):
         """
         AI 엔진 초기화
         
         Args:
             config: AI 설정 딕셔너리
-                - api_url: Ollama API 엔드포인트
-                - model: 사용할 모델명 (qwen3:8b)
+                - provider: AI 제공자 (ollama / gemini)
+                - api_url: Ollama API 엔드포인트 (ollama 사용 시)
+                - model: 사용할 모델명
                 - timeout: API 타임아웃 (초)
                 - max_queue_size: 최대 큐 크기
                 - retry_count: 재시도 횟수
+            secrets: API 키 등 비밀 설정
         """
         self.config = config
+        self.secrets = secrets or {}
+        
+        # 🆕 AI 제공자 설정 (ollama / gemini)
+        self.provider = config.get('provider', 'ollama').lower()
         
         # API 설정
-        self.api_url = config.get('api_url', 'http://localhost:11434/api/generate')
-        self.model = config.get('model', 'qwen3:8b')
+        if self.provider == 'gemini':
+            # Gemini API 설정
+            self.model = config.get('model', 'gemini-2.0-flash-exp')
+            self.api_key = self.secrets.get('gemini', {}).get('api_key', '')
+            self.api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+            if not self.api_key:
+                logger.warning("⚠️ Gemini API 키가 설정되지 않았습니다. secrets.yaml을 확인하세요.")
+        else:
+            # Ollama API 설정 (기본)
+            self.api_url = config.get('api_url', 'http://localhost:11434/api/generate')
+            self.model = config.get('model', 'qwen3:8b')
+            self.api_key = None
+        
         self.timeout = config.get('timeout', 10)
         self.max_queue_size = config.get('max_queue_size', 50)
         self.retry_count = config.get('retry_count', 2)
@@ -129,7 +146,8 @@ class AIEngine:
         # 누적 학습 저장소 (지연 로딩)
         self._learning_store = None
         
-        logger.info(f"AI 엔진 초기화 완료 (모델: {self.model}, 타임아웃: {self.timeout}초)")
+        provider_display = f"Gemini ({self.model})" if self.provider == 'gemini' else f"Ollama ({self.model})"
+        logger.info(f"AI 엔진 초기화 완료 (제공자: {provider_display}, 타임아웃: {self.timeout}초)")
     
     # =========================================================================
     # 누적 학습 저장소
@@ -391,11 +409,17 @@ class AIEngine:
             # 프롬프트 생성
             prompt = self._build_prompt(request)
             
-            # Qwen3 API 호출 (재시도 포함)
-            response_text = self._call_qwen3_with_retry(prompt)
+            # 🆕 API 호출 (provider에 따라 분기)
+            response_text = self._call_api_with_retry(prompt)
+            
+            # 🆕 원본 응답 로깅 (디버깅용)
+            logger.debug(f"AI 원본 응답 ({stock_code}): {response_text[:500]}...")
             
             # 응답 파싱
             parsed = self._parse_response(response_text)
+            
+            # 🆕 파싱 결과 로깅
+            logger.debug(f"AI 파싱 결과 ({stock_code}): {parsed}")
             
             elapsed = time.time() - start_time
             
@@ -410,6 +434,8 @@ class AIEngine:
                 'confidence': parsed['confidence'],
                 'reason': parsed['reason'],
                 'original_price': request['current_price'],
+                'rule_score': request.get('rule_score', 0),  # 🆕 점수 추가
+                'indicators': request.get('indicators', {}),  # 🆕 지표 추가 (CCI 포함)
                 'elapsed': elapsed,
                 'timestamp': time.time(),
             }
@@ -441,6 +467,7 @@ class AIEngine:
         
         영어로 작성하여 모델 성능 최적화.
         JSON 출력을 강제하여 파싱 안정성 확보.
+        🆕 학습 데이터 패턴 통계 포함
         
         Args:
             request: 요청 딕셔너리
@@ -451,6 +478,7 @@ class AIEngine:
         indicators = request.get('indicators', {})
         market_state = request.get('market_state', {})
         rule_score = request.get('rule_score', 0)
+        stock_code = request.get('stock_code', '')
         
         # 시장 상태 해석
         market_mode = market_state.get('mode', 'NORMAL')
@@ -466,61 +494,119 @@ class AIEngine:
         consec_bullish = indicators.get('consec_bullish', 0)
         candle_score = indicators.get('candle_score', 0)
         
-        # 과거 통계 가져오기
+        # 🆕 학습 데이터에서 패턴별 통계 가져오기
         try:
             stats = self.learning_store.get_stats()
             winrate = stats.get('winrate', 50)
             total_trades = stats.get('total_trades', 0)
-        except Exception:
+            
+            # 패턴별 통계
+            pattern_stats = self.learning_store.get_pattern_stats()
+            
+            # CCI 구간 판단 및 해당 구간 승률
+            if cci < -100:
+                cci_zone = 'oversold'
+            elif cci > 100:
+                cci_zone = 'overbought'
+            else:
+                cci_zone = 'neutral'
+            cci_zone_stats = pattern_stats.get('cci_stats', {}).get(cci_zone, {})
+            cci_winrate = cci_zone_stats.get('winrate', 50)
+            cci_trades = cci_zone_stats.get('total', 0)
+            
+            # 점수 구간 판단 및 해당 구간 승률
+            if rule_score >= 80:
+                score_zone = 'high'
+            elif rule_score >= 70:
+                score_zone = 'medium'
+            else:
+                score_zone = 'low'
+            score_zone_stats = pattern_stats.get('score_stats', {}).get(score_zone, {})
+            score_winrate = score_zone_stats.get('winrate', 50)
+            score_trades = score_zone_stats.get('total', 0)
+            
+            # 종목별 통계
+            stock_stats = self.learning_store.get_stock_stats(stock_code)
+            stock_winrate = stock_stats.get('winrate', 50)
+            stock_trades = stock_stats.get('total_trades', 0)
+            
+        except Exception as e:
+            logger.debug(f"학습 데이터 로드 실패: {e}")
             winrate = 50
             total_trades = 0
+            cci_zone = 'neutral'
+            cci_winrate = 50
+            cci_trades = 0
+            score_zone = 'medium'
+            score_winrate = 50
+            score_trades = 0
+            stock_winrate = 50
+            stock_trades = 0
+        
+        # 🆕 패턴 기반 경고 메시지 생성
+        warnings = []
+        if cci_trades >= 5 and cci_winrate < 40:
+            warnings.append(f"⚠️ CCI {cci_zone} zone has {cci_winrate:.0f}% win rate")
+        if score_trades >= 5 and score_winrate < 40:
+            warnings.append(f"⚠️ Score {score_zone} zone has {score_winrate:.0f}% win rate")
+        if stock_trades >= 3 and stock_winrate < 40:
+            warnings.append(f"⚠️ This stock has {stock_winrate:.0f}% win rate")
+        warning_text = "\n".join(warnings) if warnings else "No pattern warnings"
         
         # 프롬프트 구성 (영어, JSON 강제)
-        prompt = f"""You are a Korean stock scalping trading AI. Your task is to analyze the given indicators and decide whether to BUY or HOLD.
+        # 🆕 Gemini용으로 /no_think 제거 (Ollama 전용 지시어)
+        prompt = f"""You are a conservative Korean stock scalping AI. Analyze indicators and decide BUY or HOLD.
 
-[MARKET STATUS]
-- KOSPI Change: {market_change:+.2f}%
-- Market Mode: {market_mode}
-- Trend: {market_status} ({"above" if above_ma20 else "below"} MA20)
+[MARKET]
+- KOSPI: {market_change:+.2f}% | Mode: {market_mode} | Trend: {market_status}
 
-[STOCK INDICATORS]
-- Rule-based Score: {rule_score:.1f}/100
+[STOCK]
+- Score: {rule_score:.1f}/100
 - CCI(14): {cci:.1f}
-- Price Change: {change_pct:+.2f}%
-- Distance from MA20: {distance_ma20:+.2f}%
-- Volume Ratio: {volume_ratio:.2f}x
-- Consecutive Bullish Days: {consec_bullish}
-- Candle Quality Score: {candle_score:.1f}/15
+- Change: {change_pct:+.2f}%
+- MA20 Distance: {distance_ma20:+.2f}%
+- Volume: {volume_ratio:.2f}x
+- Bullish Days: {consec_bullish}
 
-[HISTORICAL PERFORMANCE]
-- Past Win Rate: {winrate:.1f}%
-- Total Trades: {total_trades}
+[LEARNING DATA - YOUR PAST PERFORMANCE]
+- Overall: {winrate:.1f}% win rate ({total_trades} trades)
+- CCI {cci_zone} zone: {cci_winrate:.1f}% win rate ({cci_trades} trades)
+- Score {score_zone} zone: {score_winrate:.1f}% win rate ({score_trades} trades)
+- This stock: {stock_winrate:.1f}% win rate ({stock_trades} trades)
 
-[DECISION RULES]
-1. If Score >= 75 AND CCI > -100 AND Volume > 1.0x → BUY with HIGH confidence (0.8+)
-2. If Score 65-74 AND indicators are mixed → BUY with MEDIUM confidence (0.6-0.79)
-3. If market is EMERGENCY or indicators are poor → HOLD
-4. If CCI < -150 or Volume < 0.5x → HOLD (oversold or low interest)
+[PATTERN WARNINGS]
+{warning_text}
 
-[IMPORTANT]
-- This is SCALPING strategy targeting 0.8-1.5% profit
-- Be conservative in BEARISH market (require higher score)
-- Respond with ONLY valid JSON, no other text or explanation
+[RULES - BE CONSERVATIVE]
+**MUST HOLD if ANY of these:**
+- CCI > 200 (overbought, likely to drop)
+- CCI < -100 (oversold, wait for reversal)
+- Volume < 0.7x (low interest)
+- Change > +5% (already pumped today)
+- Market mode is EMERGENCY or CONSERVATIVE
+- Pattern win rate < 40%
 
-Respond with ONLY this JSON format:
-{{"decision": "BUY", "confidence": 0.75, "reason": "brief 10-word reason"}}
+**BUY conditions (ALL must be true):**
+- Score >= 75: confidence 0.80-0.85
+- Score 70-74: confidence 0.70-0.75
+- Score 65-69: confidence 0.60-0.65 (only if Volume > 1.0x AND CCI 0~150)
 
-Your JSON response:"""
+**Default to HOLD when uncertain.** Missing a trade is better than losing.
+
+Output ONLY valid JSON:
+{{"decision": "BUY", "confidence": 0.75, "reason": "brief"}} or {{"decision": "HOLD", "confidence": 0.5, "reason": "brief"}}
+
+JSON:"""
         
         return prompt
     
     # =========================================================================
-    # Qwen3 API 호출
+    # API 호출 (Provider별 분기)
     # =========================================================================
     
-    def _call_qwen3_with_retry(self, prompt: str) -> str:
+    def _call_api_with_retry(self, prompt: str) -> str:
         """
-        Qwen3 API 호출 (재시도 포함)
+        AI API 호출 (재시도 포함)
         
         Args:
             prompt: 프롬프트 문자열
@@ -533,16 +619,20 @@ Your JSON response:"""
             Exception: API 호출 실패
         """
         last_error = None
+        provider_name = "Gemini" if self.provider == 'gemini' else "Ollama"
         
         for attempt in range(self.retry_count + 1):
             try:
-                return self._call_qwen3(prompt)
+                if self.provider == 'gemini':
+                    return self._call_gemini(prompt)
+                else:
+                    return self._call_ollama(prompt)
             except requests.Timeout:
                 last_error = TimeoutError(f"API 타임아웃 ({self.timeout}초)")
-                logger.warning(f"Qwen3 타임아웃 (시도 {attempt + 1}/{self.retry_count + 1})")
+                logger.warning(f"{provider_name} 타임아웃 (시도 {attempt + 1}/{self.retry_count + 1})")
             except Exception as e:
                 last_error = e
-                logger.warning(f"Qwen3 API 에러 (시도 {attempt + 1}): {e}")
+                logger.warning(f"{provider_name} API 에러 (시도 {attempt + 1}): {e}")
             
             # 재시도 전 잠시 대기
             if attempt < self.retry_count:
@@ -550,9 +640,60 @@ Your JSON response:"""
         
         raise last_error
     
-    def _call_qwen3(self, prompt: str) -> str:
+    def _call_gemini(self, prompt: str) -> str:
         """
-        Qwen3 API 단일 호출
+        Gemini API 호출
+        
+        Args:
+            prompt: 프롬프트 문자열
+        
+        Returns:
+            응답 텍스트
+        """
+        url = f"{self.api_url}?key={self.api_key}"
+        
+        payload = {
+            "contents": [{
+                "parts": [{"text": prompt}]
+            }],
+            "generationConfig": {
+                "temperature": 0.1,
+                "maxOutputTokens": 200,
+                "topP": 0.9,
+            },
+            # 🆕 안전 설정 (BLOCK_NONE으로 설정하여 금융 관련 내용 허용)
+            "safetySettings": [
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+            ]
+        }
+        
+        response = requests.post(
+            url,
+            json=payload,
+            timeout=self.timeout,
+            headers={"Content-Type": "application/json"}
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            # Gemini 응답 구조: candidates[0].content.parts[0].text
+            try:
+                raw_response = data['candidates'][0]['content']['parts'][0]['text']
+                logger.info(f"AI 원본 응답: {raw_response[:200]}...")
+                return raw_response
+            except (KeyError, IndexError) as e:
+                logger.error(f"Gemini 응답 파싱 에러: {data}")
+                raise Exception(f"Gemini 응답 파싱 실패: {e}")
+        else:
+            error_msg = response.text[:200] if response.text else str(response.status_code)
+            raise Exception(f"Gemini API 에러: {response.status_code} - {error_msg}")
+    
+    def _call_ollama(self, prompt: str) -> str:
+        """
+        Ollama API 호출 (Qwen3 등 로컬 모델)
         
         Args:
             prompt: 프롬프트 문자열
@@ -568,7 +709,8 @@ Your JSON response:"""
                 "temperature": 0.1,     # 낮은 temperature로 일관된 응답
                 "num_predict": 150,     # 최대 토큰 수 제한
                 "top_p": 0.9,
-            }
+            },
+            "think": False,  # Qwen3 thinking 비활성화
         }
         
         response = requests.post(
@@ -579,9 +721,20 @@ Your JSON response:"""
         
         if response.status_code == 200:
             data = response.json()
-            return data.get('response', '')
+            raw_response = data.get('response', '')
+            logger.info(f"AI 원본 응답: {raw_response[:200]}...")
+            return raw_response
         else:
-            raise Exception(f"API 응답 에러: {response.status_code}")
+            raise Exception(f"Ollama API 응답 에러: {response.status_code}")
+    
+    # 🆕 기존 함수 호환성 유지
+    def _call_qwen3_with_retry(self, prompt: str) -> str:
+        """기존 코드 호환용 - _call_api_with_retry로 대체됨"""
+        return self._call_api_with_retry(prompt)
+    
+    def _call_qwen3(self, prompt: str) -> str:
+        """기존 코드 호환용 - _call_ollama로 대체됨"""
+        return self._call_ollama(prompt)
     
     # =========================================================================
     # 응답 파싱 (강화된 버전)
@@ -615,6 +768,10 @@ Your JSON response:"""
         
         # Step 1: <think>...</think> 태그 제거 (Qwen3 특성)
         text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        
+        # Step 1.5: "Thinking..." ~ "...done thinking." 텍스트 제거 (Qwen3 CLI 출력)
+        text = re.sub(r'Thinking\.\.\..*?\.\.\.done thinking\.', '', text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'Thinking\.\.\..*$', '', text, flags=re.DOTALL)  # done thinking 없는 경우
         
         # Step 2: 줄바꿈/탭/공백 정리
         text = re.sub(r'[\n\r\t]+', ' ', text)
@@ -679,7 +836,8 @@ Your JSON response:"""
                 'reason': reason,
             }
             
-        except (json.JSONDecodeError, ValueError, TypeError):
+        except (json.JSONDecodeError, ValueError, TypeError) as e:
+            logger.debug(f"JSON 파싱 실패: {e}, 원본: {json_str[:100]}")
             return None
     
     def _extract_from_text(self, text: str, original: str = "") -> Dict:
@@ -696,6 +854,9 @@ Your JSON response:"""
         Returns:
             추출된 결과 딕셔너리
         """
+        # 🆕 Fallback 진입 시 경고 로그
+        logger.warning(f"AI JSON 파싱 실패, Fallback 사용. 원본: {original[:200]}...")
+        
         text_upper = text.upper()
         
         # 결정 추출

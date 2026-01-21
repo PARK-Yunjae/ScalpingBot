@@ -345,12 +345,47 @@ class KISBroker:
             "appkey": self.app_key,
             "appsecret": self.app_secret,
             "content-type": "application/json; charset=utf-8",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",  # 권장 User-Agent
         }
         
         if tr_id:
             headers["tr_id"] = tr_id
         
         return headers
+    
+    def _get_hashkey(self, body: Dict) -> str:
+        """
+        주문 요청에 사용할 Hashkey 생성 (보안 강화)
+        
+        Hashkey는 주문 요청 데이터의 무결성을 보장합니다.
+        한투 API 권장사항이며, 주문 관련 API에서 사용 권장.
+        
+        Args:
+            body: 주문 요청 바디
+        
+        Returns:
+            해시키 문자열 (실패 시 빈 문자열)
+        """
+        try:
+            response = requests.post(
+                f"{self.base_url}/uapi/hashkey",
+                headers={
+                    "appkey": self.app_key,
+                    "appsecret": self.app_secret,
+                    "content-type": "application/json; charset=utf-8",
+                },
+                json=body,
+                timeout=REQUEST_TIMEOUT
+            )
+            
+            if response.status_code == 200:
+                return response.json().get('HASH', '')
+            else:
+                logger.warning(f"Hashkey 생성 실패: {response.status_code}")
+                return ''
+        except Exception as e:
+            logger.warning(f"Hashkey 생성 오류: {e}")
+            return ''
     
     # =========================================================================
     # API 요청 래퍼 (재시도 로직 포함)
@@ -421,6 +456,13 @@ class KISBroker:
                 if response.status_code == 429:
                     wait_time = RETRY_DELAY * (attempt + 1)
                     logger.warning(f"Rate Limit 도달, {wait_time}초 대기... (시도 {attempt + 1})")
+                    time.sleep(wait_time)
+                    continue
+                
+                # 5xx: 서버 오류 → 대기 후 재시도
+                if 500 <= response.status_code < 600:
+                    wait_time = RETRY_DELAY * (attempt + 1)
+                    logger.warning(f"서버 오류 {response.status_code}, {wait_time}초 대기... (시도 {attempt + 1})")
                     time.sleep(wait_time)
                     continue
                 
@@ -577,16 +619,33 @@ class KISBroker:
                 "ORD_UNPR": str(price) if price > 0 else "0",
             }
             
-            response = self._request(
-                method='POST',
-                endpoint='/uapi/domestic-stock/v1/trading/order-cash',
-                tr_id=tr_id,
-                json_body=body
+            # 🆕 Hashkey 생성 (보안 강화)
+            hashkey = self._get_hashkey(body)
+            
+            # 헤더 생성 (Hashkey 포함)
+            headers = self._get_headers(tr_id)
+            if hashkey:
+                headers["hashkey"] = hashkey
+            
+            # 🆕 직접 API 호출 (Hashkey 포함 위해)
+            url = f"{self.base_url}/uapi/domestic-stock/v1/trading/order-cash"
+            self._stats['total_api_calls'] += 1
+            
+            response = requests.post(
+                url,
+                headers=headers,
+                json=body,
+                timeout=REQUEST_TIMEOUT
             )
             
+            if response.status_code != 200:
+                raise Exception(f"HTTP {response.status_code}")
+            
+            response_data = response.json()
+            
             # 응답 처리
-            if response.get('rt_cd') == '0':
-                output = response.get('output', {})
+            if response_data.get('rt_cd') == '0':
+                output = response_data.get('output', {})
                 
                 result = OrderResult(
                     success=True,
@@ -606,7 +665,7 @@ class KISBroker:
                 
                 return result
             else:
-                error_msg = response.get('msg1', response.get('msg', '주문 실패'))
+                error_msg = response_data.get('msg1', response_data.get('msg', '주문 실패'))
                 
                 result = OrderResult(
                     success=False,
@@ -1134,6 +1193,127 @@ class KISBroker:
             logger.error(f"일봉 조회 에러 ({stock_code}): {e}")
             return []
     
+    def get_minute_ohlcv(
+        self,
+        stock_code: str,
+        interval: int = 5,
+        count: int = 30,
+    ) -> List[Dict]:
+        """
+        분봉 데이터 조회 (한투 API FHKST03010100)
+        
+        Args:
+            stock_code: 종목 코드
+            interval: 봉 간격 (1, 3, 5, 10, 15, 30, 60분)
+            count: 조회할 봉 개수
+        
+        Returns:
+            분봉 데이터 리스트 (최신순 정렬)
+            [
+                {'timestamp': 'HHmm', 'open': ..., 'high': ..., 'low': ..., 
+                 'close': ..., 'volume': ...},
+                ...
+            ]
+        """
+        try:
+            # 현재 시간 (HHMMSS)
+            from datetime import datetime
+            now = datetime.now()
+            time_str = now.strftime("%H%M%S")
+            
+            params = {
+                "FID_ETC_CLS_CODE": "",
+                "FID_COND_MRKT_DIV_CODE": "J",  # 주식
+                "FID_INPUT_ISCD": stock_code,
+                "FID_INPUT_HOUR_1": time_str,  # 조회 기준 시간
+                "FID_PW_DATA_INCU_YN": "N",    # 과거 데이터 포함 여부
+            }
+            
+            # tr_id: FHKST03010100 (국내주식분봉조회)
+            response = self._request(
+                method='GET',
+                endpoint='/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice',
+                tr_id='FHKST03010100',
+                params=params
+            )
+            
+            ohlcv_list = []
+            output2 = response.get('output2', [])
+            
+            for item in output2[:count]:
+                # 시간 형식: HHMMSS
+                raw_time = item.get('stck_cntg_hour', '')
+                if len(raw_time) >= 4:
+                    formatted_time = f"{raw_time[:2]}:{raw_time[2:4]}"
+                else:
+                    formatted_time = raw_time
+                
+                ohlcv_list.append({
+                    'timestamp': formatted_time,
+                    'open': float(item.get('stck_oprc', 0)),
+                    'high': float(item.get('stck_hgpr', 0)),
+                    'low': float(item.get('stck_lwpr', 0)),
+                    'close': float(item.get('stck_prpr', 0)),  # 현재가 = 종가
+                    'volume': int(item.get('cntg_vol', 0)),   # 체결량
+                    'cumulative_volume': int(item.get('acml_vol', 0)),  # 누적 거래량
+                })
+            
+            logger.debug(f"분봉 조회 성공 ({stock_code}): {len(ohlcv_list)}개")
+            return ohlcv_list
+        
+        except Exception as e:
+            logger.error(f"분봉 조회 에러 ({stock_code}): {e}")
+            return []
+    
+    def get_minute_ohlcv_n(
+        self,
+        stock_code: str,
+        interval: int = 5,
+        count: int = 30,
+    ) -> List[Dict]:
+        """
+        N분봉 데이터 조회 (분봉 데이터를 집계)
+        
+        1분봉 데이터를 받아서 N분봉으로 변환합니다.
+        
+        Args:
+            stock_code: 종목 코드
+            interval: 봉 간격 (분)
+            count: 필요한 봉 개수
+        
+        Returns:
+            N분봉 데이터 리스트
+        """
+        # 1분봉을 더 많이 조회
+        minute_data = self.get_minute_ohlcv(
+            stock_code=stock_code,
+            interval=1,
+            count=count * interval + 10  # 여유있게
+        )
+        
+        if not minute_data or interval == 1:
+            return minute_data
+        
+        # N분봉으로 집계
+        aggregated = []
+        
+        for i in range(0, len(minute_data), interval):
+            chunk = minute_data[i:i+interval]
+            if not chunk:
+                break
+            
+            # 집계
+            aggregated.append({
+                'timestamp': chunk[0]['timestamp'],  # 시작 시간
+                'open': chunk[-1]['open'],           # 가장 오래된 봉의 시가
+                'high': max(c['high'] for c in chunk),
+                'low': min(c['low'] for c in chunk),
+                'close': chunk[0]['close'],          # 가장 최신 봉의 종가
+                'volume': sum(c['volume'] for c in chunk),
+            })
+        
+        return aggregated[:count]
+    
     def get_index_daily(
         self,
         index_code: str = '0001',
@@ -1202,6 +1382,232 @@ class KISBroker:
             'dry_run': self.dry_run,
             'environment': self.environment,
         }
+    
+    # =========================================================================
+    # 조건검색 API (psearch)
+    # =========================================================================
+    
+    def get_condition_list(self, hts_id: str) -> List[Dict[str, str]]:
+        """
+        사용자 조건검색식 목록 조회 (psearch-title)
+        
+        Args:
+            hts_id: HTS 사용자 ID
+        
+        Returns:
+            [{"seq": "0", "name": "TV100"}, ...]
+        """
+        endpoint = "/uapi/domestic-stock/v1/quotations/psearch-title"
+        tr_id = "HHKST03900300"
+        
+        params = {"user_id": hts_id}
+        
+        try:
+            headers = self._get_headers(tr_id)
+            url = f"{self.base_url}{endpoint}"
+            
+            response = requests.get(
+                url,
+                headers=headers,
+                params=params,
+                timeout=REQUEST_TIMEOUT
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"조건검색 목록 조회 실패: HTTP {response.status_code}")
+                return []
+            
+            data = response.json()
+            
+            # 조건 목록이 들어있는 리스트 자동 탐색
+            output = None
+            for key in ["output2", "output", "output1", "list", "data", "items", "result"]:
+                candidate = data.get(key)
+                if isinstance(candidate, list) and len(candidate) > 0:
+                    output = candidate
+                    logger.debug(f"조건검색 목록 키: {key} (count={len(output)})")
+                    break
+            
+            if output is None:
+                output = []
+                logger.warning("조건검색 응답에서 목록을 찾을 수 없습니다")
+            
+            def pick_seq(item: dict) -> str:
+                """seq 후보 키를 폭넓게 커버"""
+                seq_keys = ["seq", "sn", "scts_seq", "screen_no", "cond_seq", 
+                            "condition_seq", "no", "idx", "id", "num"]
+                for key in seq_keys:
+                    val = item.get(key)
+                    if val is not None:
+                        return str(val).strip()
+                return ""
+            
+            def pick_name(item: dict) -> str:
+                """name 후보 키를 폭넓게 커버"""
+                name_keys = ["name", "condition_name", "cond_nm", "condition_nm", 
+                             "cond_name", "tr_cond_nm", "title", "cond_title",
+                             "screen_name", "screen_nm", "nm", "label"]
+                for key in name_keys:
+                    val = item.get(key)
+                    if isinstance(val, str) and val.strip():
+                        return val.strip()
+                return ""
+            
+            conditions: List[Dict[str, str]] = []
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+                seq = pick_seq(item)
+                name = pick_name(item)
+                if seq != "":
+                    conditions.append({"seq": seq, "name": name})
+            
+            logger.info(f"조건검색식 목록 조회 완료: {len(conditions)}개")
+            return conditions
+        
+        except Exception as e:
+            logger.error(f"조건검색식 목록 조회 실패: {e}")
+            return []
+    
+    def get_condition_result(
+        self,
+        hts_id: str,
+        seq: str,
+        limit: int = 500,
+    ) -> List[Dict[str, Any]]:
+        """
+        조건검색 결과 조회 (psearch-result)
+        
+        Args:
+            hts_id: HTS 사용자 ID
+            seq: 조건식 번호
+            limit: 최대 조회 개수
+        
+        Returns:
+            [{"code": "005930", "name": "삼성전자", "market": "KOSPI"}, ...]
+        """
+        endpoint = "/uapi/domestic-stock/v1/quotations/psearch-result"
+        tr_id = "HHKST03900400"
+        
+        params = {"user_id": hts_id, "seq": str(seq).strip()}
+        
+        try:
+            headers = self._get_headers(tr_id)
+            url = f"{self.base_url}{endpoint}"
+            
+            response = requests.get(
+                url,
+                headers=headers,
+                params=params,
+                timeout=REQUEST_TIMEOUT
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"조건검색 결과 조회 실패: HTTP {response.status_code}")
+                return []
+            
+            data = response.json()
+            
+            output = data.get("output2") or data.get("output") or []
+            if not isinstance(output, list):
+                output = []
+            
+            stocks: List[Dict[str, Any]] = []
+            for item in output[:limit]:
+                if not isinstance(item, dict):
+                    continue
+                
+                # 코드 파싱 (키 다양)
+                code = (
+                    item.get("mksc_shrn_iscd")
+                    or item.get("stck_shrn_iscd")
+                    or item.get("pdno")
+                    or item.get("code")
+                    or ""
+                )
+                code = str(code).strip()
+                if not code:
+                    continue
+                code = code.zfill(6)
+                
+                # 이름 파싱 (키 다양)
+                name = (
+                    item.get("name")
+                    or item.get("hts_kor_isnm")
+                    or item.get("prdt_name")
+                    or item.get("kor_item_name")
+                    or item.get("itmsNm")
+                    or item.get("stck_shrn_iscd_name")
+                    or ""
+                )
+                name = str(name).strip()
+                
+                # 시장 구분
+                market = "KOSPI"
+                market_code = item.get("mrkt_div_code") or item.get("mrkt_cls_code") or ""
+                if market_code in ("Q", "J2", "KOSDAQ"):
+                    market = "KOSDAQ"
+                
+                stocks.append({
+                    "code": code,
+                    "name": name,
+                    "market": market,
+                })
+            
+            logger.info(f"조건검색 결과 조회 완료: {len(stocks)}개")
+            return stocks
+        
+        except Exception as e:
+            logger.error(f"조건검색 결과 조회 실패: {e}")
+            return []
+    
+    def get_condition_universe(
+        self,
+        hts_id: str,
+        condition_name: str,
+        limit: int = 500,
+    ) -> List[Dict[str, Any]]:
+        """
+        조건검색 기반 유니버스 조회
+        
+        Args:
+            hts_id: HTS 사용자 ID
+            condition_name: 조건식 이름 (예: "TV100")
+            limit: 최대 조회 개수
+        
+        Returns:
+            [{"code": "005930", "name": "삼성전자", "market": "KOSPI"}, ...]
+        """
+        if not hts_id:
+            logger.error("HTS 사용자 ID가 설정되지 않았습니다")
+            return []
+        
+        want = (condition_name or "").strip().lower()
+        logger.info(f"조건검색 유니버스 조회 시작: {condition_name} (user={hts_id})")
+        
+        # 1. 조건식 목록 조회
+        conditions = self.get_condition_list(hts_id)
+        if not conditions:
+            logger.warning("조건검색식 목록이 비어있습니다 (HTS [0110] 서버저장 여부 확인)")
+            return []
+        
+        # 2. 원하는 조건식 찾기
+        target_seq = None
+        for cond in conditions:
+            cond_name = (cond.get("name") or "").strip().lower()
+            if cond_name == want or want in cond_name:
+                target_seq = cond.get("seq")
+                break
+        
+        if target_seq is None:
+            logger.error(f"조건검색식 '{condition_name}'을 찾을 수 없습니다")
+            logger.info(f"사용 가능한 조건식: {[c.get('name') for c in conditions]}")
+            return []
+        
+        logger.info(f"조건검색식 찾음: {condition_name} -> seq={target_seq}")
+        
+        # 3. 조건식 결과 조회
+        return self.get_condition_result(hts_id, target_seq, limit)
     
     def health_check(self) -> bool:
         """

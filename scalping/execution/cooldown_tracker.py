@@ -44,10 +44,10 @@ logger = logging.getLogger('ScalpingBot.Cooldown')
 # =============================================================================
 
 # 기본 쿨타임 (분)
-DEFAULT_COOLDOWN_MINUTES = 10
+DEFAULT_COOLDOWN_MINUTES = 5
 
 # 손절 후 쿨타임 (분)
-LOSS_COOLDOWN_MINUTES = 20
+LOSS_COOLDOWN_MINUTES = 10
 
 # 연속 손절 추가 쿨타임 (분)
 CONSECUTIVE_LOSS_PENALTY = 10

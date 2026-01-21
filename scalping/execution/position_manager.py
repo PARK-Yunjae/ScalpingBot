@@ -52,16 +52,30 @@ logger = logging.getLogger('ScalpingBot.Position')
 # 데이터베이스 경로
 DEFAULT_DB_PATH = Path(__file__).parent.parent.parent / 'db' / 'positions.db'
 
-# 익절 목표 설정 (등급별)
+# ============================================================================
+# 스캘핑용 설정 (v3.0)
+# ============================================================================
+# 거래비용: 0.54% (슬리피지 0.33% + 수수료 0.03% + 세금 0.18%)
+# 손절: -0.7% → 순손 -1.24%
+# 익절: +1.5% → 순익 +0.96%
+# 필요 승률: 56% 이상
+# ============================================================================
+
+# 익절 목표 설정 (스캘핑용 - 등급 단순화)
 PROFIT_TARGETS = {
-    'S': {'min_score': 90, 'target_profit': 1.5, 'trailing_stop': 0.5},
-    'A': {'min_score': 80, 'target_profit': 1.2, 'trailing_stop': 0.4},
-    'B': {'min_score': 70, 'target_profit': 1.0, 'trailing_stop': 0.3},
-    'C': {'min_score': 0,  'target_profit': 0.8, 'trailing_stop': 0.3},
+    'S': {'min_score': 75, 'target_profit': 2.0, 'trailing_stop': 0.4},
+    'A': {'min_score': 65, 'target_profit': 1.5, 'trailing_stop': 0.4},
+    'B': {'min_score': 55, 'target_profit': 1.5, 'trailing_stop': 0.4},
+    'C': {'min_score': 0,  'target_profit': 1.5, 'trailing_stop': 0.4},
 }
 
-# 손절 설정
-DEFAULT_STOP_LOSS = -1.5  # -1.5%
+# 손절 설정 (스캘핑용)
+DEFAULT_STOP_LOSS = -0.7  # -0.7% (순손 -1.24%)
+
+# 시간 손절 설정
+DEFAULT_TIME_STOP_MINUTES = 3     # N분 내 수익 없으면 청산
+DEFAULT_TIME_STOP_THRESHOLD = 0.3  # 최소 기대 수익률 (%)
+DEFAULT_MAX_HOLD_MINUTES = 10      # 최대 보유 시간 (분)
 
 
 class SellReason(Enum):
@@ -69,7 +83,10 @@ class SellReason(Enum):
     TAKE_PROFIT = "익절"
     STOP_LOSS = "손절"
     TRAILING_STOP = "트레일링"
-    TIME_LIMIT = "시간청산"
+    TIME_STOP = "시간손절"         # 🆕 시간 손절
+    TIME_LIMIT = "시간청산"        # 장 마감
+    VWAP_BREAK = "VWAP이탈"       # 🆕 VWAP 이탈
+    LUNCH_BREAK = "점심청산"
     EMERGENCY = "비상청산"
     MANUAL = "수동청산"
 
@@ -113,6 +130,9 @@ class PositionInfo:
     profit_pct: float = 0.0            # 현재 수익률 (%)
     high_profit_pct: float = 0.0       # 최고 수익률 (%)
     
+    # 🆕 지표
+    entry_cci: float = 0.0             # 매수 시점 CCI
+    
     # 메타
     id: int = 0
     updated_at: datetime = field(default_factory=datetime.now)
@@ -136,6 +156,7 @@ class PositionInfo:
             'stop_loss': self.stop_loss,
             'profit_pct': self.profit_pct,
             'high_profit_pct': self.high_profit_pct,
+            'entry_cci': self.entry_cci,  # 🆕
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }
 
@@ -220,9 +241,16 @@ class PositionManager:
                     target_profit REAL DEFAULT 1.0,
                     trailing_stop REAL DEFAULT 0.3,
                     stop_loss REAL DEFAULT -1.5,
+                    entry_cci REAL DEFAULT 0,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            
+            # 🆕 기존 DB에 entry_cci 컬럼이 없으면 추가
+            try:
+                cursor.execute("ALTER TABLE positions ADD COLUMN entry_cci REAL DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass  # 이미 존재
             
             # 인덱스 생성
             cursor.execute("""
@@ -242,6 +270,13 @@ class PositionManager:
                     cursor.execute("SELECT * FROM positions")
                     
                     for row in cursor.fetchall():
+                        # 🆕 entry_cci 안전하게 읽기 (기존 DB 호환)
+                        entry_cci = 0.0
+                        try:
+                            entry_cci = row['entry_cci'] or 0.0
+                        except (IndexError, KeyError):
+                            pass
+                        
                         position = PositionInfo(
                             id=row['id'],
                             stock_code=row['stock_code'],
@@ -256,6 +291,7 @@ class PositionManager:
                             target_profit=row['target_profit'] or 1.0,
                             trailing_stop=row['trailing_stop'] or 0.3,
                             stop_loss=row['stop_loss'] or self.stop_loss,
+                            entry_cci=entry_cci,  # 🆕
                         )
                         
                         self._positions[position.stock_code] = position
@@ -277,6 +313,7 @@ class PositionManager:
         quantity: int,
         score: float = 0,
         ai_confidence: float = 0,
+        entry_cci: float = 0,  # 🆕 CCI 추가
     ) -> PositionInfo:
         """
         포지션 추가
@@ -288,6 +325,7 @@ class PositionManager:
             quantity: 수량
             score: 규칙 점수 (0~100)
             ai_confidence: AI 신뢰도 (0~1)
+            entry_cci: 매수 시점 CCI
         
         Returns:
             생성된 PositionInfo
@@ -310,6 +348,7 @@ class PositionManager:
             target_profit=targets['target_profit'],
             trailing_stop=targets['trailing_stop'],
             stop_loss=self.stop_loss,
+            entry_cci=entry_cci,  # 🆕
         )
         
         with self._lock:
@@ -453,12 +492,13 @@ class PositionManager:
     
     def _check_sell_signal(self, position: PositionInfo) -> SellSignal:
         """
-        매도 신호 체크
+        매도 신호 체크 (스캘핑용 v3.0)
         
         우선순위:
-        1. 손절 (-1.5%)
-        2. 익절 (등급별)
-        3. 트레일링 스탑 (고점 대비)
+        1. 손절 (-0.7%)
+        2. 익절 (등급별 1.5~2.0%)
+        3. 트레일링 스탑 (고점 대비 -0.4%)
+        4. 시간 손절 (3분 내 +0.3% 미달 / 10분 경과)
         
         Args:
             position: 포지션 정보
@@ -468,7 +508,7 @@ class PositionManager:
         """
         profit_pct = position.profit_pct
         
-        # 1. 손절 체크
+        # 1. 손절 체크 (-0.7%)
         if profit_pct <= position.stop_loss:
             return SellSignal(
                 stock_code=position.stock_code,
@@ -490,8 +530,8 @@ class PositionManager:
                 message=f"익절 도달 ({profit_pct:.2f}% ≥ {position.target_profit}%)"
             )
         
-        # 3. 트레일링 스탑 체크 (고점 대비)
-        if position.high_profit_pct > 0:  # 수익 구간에서만
+        # 3. 트레일링 스탑 체크 (수익 구간에서만)
+        if position.high_profit_pct >= 0.5:  # 0.5% 이상 수익 경험 시 활성화
             drop_from_high = position.high_profit_pct - profit_pct
             
             if drop_from_high >= position.trailing_stop:
@@ -504,13 +544,40 @@ class PositionManager:
                     message=f"트레일링 스탑 (고점 {position.high_profit_pct:.2f}% → 현재 {profit_pct:.2f}%)"
                 )
         
+        # 4. 시간 손절 체크 (스캘핑 핵심!)
+        hold_minutes = (datetime.now() - position.entry_time).total_seconds() / 60
+        
+        # 4-1. 3분 내 +0.3% 미달 시 청산
+        if hold_minutes >= DEFAULT_TIME_STOP_MINUTES:
+            if profit_pct < DEFAULT_TIME_STOP_THRESHOLD:
+                return SellSignal(
+                    stock_code=position.stock_code,
+                    action='SELL',
+                    reason=SellReason.TIME_STOP,
+                    current_price=position.current_price,
+                    profit_pct=profit_pct,
+                    message=f"시간손절 ({hold_minutes:.1f}분 경과, 수익 {profit_pct:.2f}% < {DEFAULT_TIME_STOP_THRESHOLD}%)"
+                )
+        
+        # 4-2. 10분 경과 + 손익 근처 시 청산
+        if hold_minutes >= DEFAULT_MAX_HOLD_MINUTES:
+            if -0.3 <= profit_pct <= 0.5:  # 손익분기 근처
+                return SellSignal(
+                    stock_code=position.stock_code,
+                    action='SELL',
+                    reason=SellReason.TIME_STOP,
+                    current_price=position.current_price,
+                    profit_pct=profit_pct,
+                    message=f"최대보유시간 ({hold_minutes:.1f}분 > {DEFAULT_MAX_HOLD_MINUTES}분, 수익 {profit_pct:.2f}%)"
+                )
+        
         # 홀드
         return SellSignal(
             stock_code=position.stock_code,
             action='HOLD',
             current_price=position.current_price,
             profit_pct=profit_pct,
-            message=f"보유 중 ({profit_pct:+.2f}%)"
+            message=f"보유 중 ({profit_pct:+.2f}%, {hold_minutes:.1f}분)"
         )
     
     def update_all_prices(
@@ -692,8 +759,8 @@ class PositionManager:
                         stock_code, stock_name, entry_price, quantity,
                         entry_time, score, ai_confidence, grade,
                         high_price, target_profit, trailing_stop, stop_loss,
-                        updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        entry_cci, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     position.stock_code,
                     position.stock_name,
@@ -707,6 +774,7 @@ class PositionManager:
                     position.target_profit,
                     position.trailing_stop,
                     position.stop_loss,
+                    position.entry_cci,  # 🆕
                     datetime.now().isoformat(),
                 ))
                 

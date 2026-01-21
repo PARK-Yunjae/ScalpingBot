@@ -413,6 +413,64 @@ class DiscordNotifier:
         logger.info(f"📢 일일 리포트 전송: {date}")
     
     # =========================================================================
+    # 포지션 현황 알림
+    # =========================================================================
+    
+    def send_position_status(
+        self,
+        positions: List[Dict],
+        total_profit_pct: float = 0.0,
+    ):
+        """
+        포지션 현황 알림 (주기적 모니터링용)
+        
+        Args:
+            positions: 포지션 리스트 [{stock_code, stock_name, profit_pct, quantity, current_price}, ...]
+            total_profit_pct: 전체 수익률
+        """
+        if not positions:
+            # 포지션이 없으면 알림 안보냄
+            return
+        
+        # 색상 결정
+        if total_profit_pct >= 0.5:
+            color = AlertLevel.SUCCESS.value
+            emoji = "📈"
+        elif total_profit_pct >= 0:
+            color = AlertLevel.INFO.value
+            emoji = "📊"
+        else:
+            color = AlertLevel.WARNING.value
+            emoji = "📉"
+        
+        # 포지션 목록 문자열
+        pos_lines = []
+        for pos in positions:
+            profit_emoji = "🟢" if pos.get('profit_pct', 0) >= 0 else "🔴"
+            pos_lines.append(
+                f"{profit_emoji} **{pos.get('stock_name', '')}** ({pos.get('stock_code', '')})\n"
+                f"   {pos.get('profit_pct', 0):+.2f}% | {pos.get('quantity', 0)}주 @ {pos.get('current_price', 0):,.0f}원"
+            )
+        
+        description = "\n".join(pos_lines)
+        
+        fields = [
+            {"name": "보유 종목", "value": f"{len(positions)}개", "inline": True},
+            {"name": "전체 수익률", "value": f"{total_profit_pct:+.2f}%", "inline": True},
+        ]
+        
+        payload = self._build_embed(
+            title=f"{emoji} 포지션 현황",
+            description=description,
+            color=color,
+            fields=fields,
+            footer=f"업데이트: {datetime.now().strftime('%H:%M:%S')}",
+        )
+        
+        self._queue_message(payload)
+        logger.info(f"📢 포지션 현황 알림: {len(positions)}개 종목")
+    
+    # =========================================================================
     # 간단한 메시지
     # =========================================================================
     

@@ -230,6 +230,7 @@ class Position:
     target_profit: float = 1.0
     trailing_stop: float = 0.3
     stop_loss: float = -1.5
+    entry_cci: float = 0.0  # 🆕 매수 시점 CCI 저장
     id: int = None
     updated_at: datetime = None
     
@@ -267,6 +268,7 @@ class Position:
             'target_profit': self.target_profit,
             'trailing_stop': self.trailing_stop,
             'stop_loss': self.stop_loss,
+            'entry_cci': self.entry_cci,  # 🆕
         }
     
     @classmethod
@@ -286,6 +288,7 @@ class Position:
             target_profit=data.get('target_profit', 1.0),
             trailing_stop=data.get('trailing_stop', 0.3),
             stop_loss=data.get('stop_loss', -1.5),
+            entry_cci=data.get('entry_cci', 0.0),  # 🆕
         )
 
 
