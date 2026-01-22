@@ -92,6 +92,7 @@ class SellReason(Enum):
     TIME_STOP = "시간손절"         # 🆕 시간 손절
     TIME_LIMIT = "시간청산"        # 장 마감
     VWAP_BREAK = "VWAP이탈"       # 🆕 VWAP 이탈
+    BREAKOUT_FAIL = "돌파실패"    # 🆕 구조 손절: 돌파선 복귀
     LUNCH_BREAK = "점심청산"
     EMERGENCY = "비상청산"
     MANUAL = "수동청산"
@@ -132,6 +133,10 @@ class PositionInfo:
     trailing_stop: float = 0.3         # 트레일링 스탑 (%)
     stop_loss: float = -1.5            # 손절선 (%)
     
+    # 🆕 구조 기반 손절 (ChatGPT 권장)
+    breakout_level: float = 0.0        # 돌파 기준가 (이 가격 아래로 복귀 시 손절)
+    vwap_at_entry: float = 0.0         # 진입 시점 VWAP (이탈 시 손절)
+    
     # 상태
     profit_pct: float = 0.0            # 현재 수익률 (%)
     high_profit_pct: float = 0.0       # 최고 수익률 (%)
@@ -160,6 +165,8 @@ class PositionInfo:
             'target_profit': self.target_profit,
             'trailing_stop': self.trailing_stop,
             'stop_loss': self.stop_loss,
+            'breakout_level': self.breakout_level,      # 🆕
+            'vwap_at_entry': self.vwap_at_entry,        # 🆕
             'profit_pct': self.profit_pct,
             'high_profit_pct': self.high_profit_pct,
             'entry_cci': self.entry_cci,  # 🆕
@@ -194,6 +201,9 @@ class PositionManager:
         self,
         db_path: Path = None,
         stop_loss: float = DEFAULT_STOP_LOSS,
+        use_structure_stop: bool = True,    # 🆕 구조 기반 손절 활성화
+        use_vwap_stop: bool = True,         # 🆕 VWAP 이탈 손절
+        use_breakout_stop: bool = True,     # 🆕 돌파선 복귀 손절
     ):
         """
         초기화
@@ -201,9 +211,17 @@ class PositionManager:
         Args:
             db_path: SQLite 데이터베이스 경로
             stop_loss: 기본 손절선 (%)
+            use_structure_stop: 구조 기반 손절 활성화
+            use_vwap_stop: VWAP 이탈 손절 활성화
+            use_breakout_stop: 돌파선 복귀 손절 활성화
         """
         self.db_path = db_path or DEFAULT_DB_PATH
         self.stop_loss = stop_loss
+        
+        # 🆕 구조 손절 옵션
+        self.use_structure_stop = use_structure_stop
+        self.use_vwap_stop = use_vwap_stop
+        self.use_breakout_stop = use_breakout_stop
         
         # DB 디렉토리 생성
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -320,6 +338,8 @@ class PositionManager:
         score: float = 0,
         ai_confidence: float = 0,
         entry_cci: float = 0,  # 🆕 CCI 추가
+        breakout_level: float = 0,  # 🆕 구조 손절용
+        vwap_at_entry: float = 0,   # 🆕 구조 손절용
     ) -> PositionInfo:
         """
         포지션 추가
@@ -332,6 +352,8 @@ class PositionManager:
             score: 규칙 점수 (0~100)
             ai_confidence: AI 신뢰도 (0~1)
             entry_cci: 매수 시점 CCI
+            breakout_level: 돌파 기준가 (구조 손절용)
+            vwap_at_entry: 진입 시점 VWAP (구조 손절용)
         
         Returns:
             생성된 PositionInfo
@@ -354,6 +376,8 @@ class PositionManager:
             target_profit=targets['target_profit'],
             trailing_stop=targets['trailing_stop'],
             stop_loss=self.stop_loss,
+            breakout_level=breakout_level,    # 🆕
+            vwap_at_entry=vwap_at_entry,      # 🆕
             entry_cci=entry_cci,  # 🆕
         )
         
@@ -524,6 +548,32 @@ class PositionManager:
                 profit_pct=profit_pct,
                 message=f"손절 도달 ({profit_pct:.2f}% ≤ {position.stop_loss}%)"
             )
+        
+        # 🆕 1.5. 구조 기반 손절 (ChatGPT 권장)
+        if self.use_structure_stop:
+            # 돌파선 복귀 손절
+            if self.use_breakout_stop and position.breakout_level > 0:
+                if position.current_price < position.breakout_level:
+                    return SellSignal(
+                        stock_code=position.stock_code,
+                        action='SELL',
+                        reason=SellReason.BREAKOUT_FAIL,
+                        current_price=position.current_price,
+                        profit_pct=profit_pct,
+                        message=f"돌파 실패 (현재가 {position.current_price:,.0f} < 돌파선 {position.breakout_level:,.0f})"
+                    )
+            
+            # VWAP 이탈 손절
+            if self.use_vwap_stop and position.vwap_at_entry > 0:
+                if position.current_price < position.vwap_at_entry:
+                    return SellSignal(
+                        stock_code=position.stock_code,
+                        action='SELL',
+                        reason=SellReason.VWAP_BREAK,
+                        current_price=position.current_price,
+                        profit_pct=profit_pct,
+                        message=f"VWAP 이탈 (현재가 {position.current_price:,.0f} < VWAP {position.vwap_at_entry:,.0f})"
+                    )
         
         # 2. 익절 체크
         if profit_pct >= position.target_profit:

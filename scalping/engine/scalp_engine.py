@@ -54,6 +54,8 @@ from scalping.strategy.minute_indicators import MinuteIndicators, OHLCV
 from scalping.strategy.scalp_signals import (
     ScalpSignalGenerator, ScalpSignal, SignalType, MarketContext
 )
+from scalping.strategy.adaptive_mode import AdaptiveMode, TradingMode  # 🆕 v3.2
+from scalping.strategy.funnel_log import FunnelLog, CandidateInfo      # 🆕 v3.2
 from scalping.safety.kill_switch import KillSwitch
 from scalping.execution.cooldown_tracker import CooldownTracker
 from scalping.notification.discord_bot import DiscordNotifier
@@ -144,6 +146,10 @@ class ScalpEngine:
         self.premarket_result: Optional[PreMarketResult] = None
         self.ai_engine: Optional[AIEngine] = None
         
+        # 🆕 v3.2 컴포넌트
+        self.adaptive_mode: Optional[AdaptiveMode] = None
+        self.funnel_log: Optional[FunnelLog] = None
+        
         # 종목 트래커 (유니버스)
         self._trackers: Dict[str, StockTracker] = {}
         
@@ -158,10 +164,16 @@ class ScalpEngine:
         
         self.stop_loss = trading_config.get('stop_loss', -0.7)
         self.take_profit_1 = trading_config.get('take_profit_1', 1.5)
-        self.min_score = trading_config.get('min_score', 55)
-        self.min_score_conservative = trading_config.get('min_score_conservative', 65)
+        self.min_score = trading_config.get('min_score', 70)  # 기본값, AdaptiveMode가 덮어씀
+        self.min_score_conservative = trading_config.get('min_score_conservative', 75)
         self.max_positions = safety_config.get('max_positions', 3)
         self.max_position_size = safety_config.get('max_position_size', 300000)
+        
+        # 🆕 구조 기반 손절 설정 (ChatGPT 권장)
+        structure_stop_config = self.config.get('structure_stop', {})
+        self.use_structure_stop = structure_stop_config.get('enabled', True)
+        self.use_breakout_stop = structure_stop_config.get('breakout_stop', True)
+        self.use_vwap_stop = structure_stop_config.get('vwap_stop', True)
         
         # 시간 설정
         self.market_open = self._parse_time(trading_config.get('market_open', '09:05'))
@@ -225,7 +237,10 @@ class ScalpEngine:
             # 2. 포지션 매니저
             logger.info("\n[2/7] 포지션 매니저 초기화...")
             self.position_manager = PositionManager(
-                stop_loss=self.stop_loss
+                stop_loss=self.stop_loss,
+                use_structure_stop=self.use_structure_stop,      # 🆕
+                use_vwap_stop=self.use_vwap_stop,                # 🆕
+                use_breakout_stop=self.use_breakout_stop,        # 🆕
             )
             logger.info("   ✅ 포지션 매니저 초기화 완료")
             
@@ -257,7 +272,7 @@ class ScalpEngine:
             logger.info("   ✅ 시그널 생성기 초기화 완료")
             
             # 7. AI 엔진 (Gemini)
-            logger.info("\n[7/8] AI 엔진 초기화...")
+            logger.info("\n[7/10] AI 엔진 초기화...")
             ai_config = self.config.get('ai', {})
             if ai_config.get('use_for_universe', False):
                 try:
@@ -273,7 +288,7 @@ class ScalpEngine:
                 logger.info("   ⏭️ AI 유니버스 선정 비활성화 (use_for_universe: false)")
             
             # 8. 프리마켓 분석기
-            logger.info("\n[8/8] 프리마켓 분석기 초기화...")
+            logger.info("\n[8/10] 프리마켓 분석기 초기화...")
             self.premarket_analyzer = PreMarketAnalyzer(
                 config=self.config,
                 broker=self.broker,
@@ -281,6 +296,22 @@ class ScalpEngine:
                 ai_engine=self.ai_engine,
             )
             logger.info("   ✅ 프리마켓 분석기 초기화 완료")
+            
+            # 🆕 9. Adaptive Mode (v3.2)
+            logger.info("\n[9/10] Adaptive Mode 초기화...")
+            adaptive_config = self.config.get('adaptive_mode', {})
+            self.adaptive_mode = AdaptiveMode(adaptive_config)
+            # AdaptiveMode의 min_score로 초기화
+            self.min_score = self.adaptive_mode.get_min_score()
+            logger.info(f"   ✅ Adaptive Mode 초기화 완료 "
+                       f"(모드: {self.adaptive_mode.get_current_mode().value}, "
+                       f"min_score: {self.min_score})")
+            
+            # 🆕 10. Funnel Log (v3.2)
+            logger.info("\n[10/10] Funnel Log 초기화...")
+            funnel_config = self.config.get('funnel_log', {})
+            self.funnel_log = FunnelLog(funnel_config)
+            logger.info("   ✅ Funnel Log 초기화 완료")
             
             # Discord 알림 (선택적)
             discord_config = self.config.get('discord', {})
@@ -1155,7 +1186,7 @@ avoid=true: 관리종목/급락/과열
             )
             
             if order_result.success:
-                # 포지션 추가
+                # 포지션 추가 (구조 손절용 레벨 포함)
                 self.position_manager.add_position(
                     stock_code=stock_code,
                     stock_name=tracker.name,
@@ -1163,6 +1194,8 @@ avoid=true: 관리종목/급락/과열
                     quantity=quantity,
                     score=signal.score,
                     entry_cci=signal.indicators.get('cci', 0),
+                    breakout_level=signal.breakout_level,      # 🆕 구조 손절용
+                    vwap_at_entry=signal.vwap_at_entry,        # 🆕 구조 손절용
                 )
                 
                 self._stats['buys'] += 1

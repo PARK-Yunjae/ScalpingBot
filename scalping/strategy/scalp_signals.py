@@ -108,6 +108,10 @@ class ScalpSignal:
     take_profit_1: float = 0.0
     take_profit_2: float = 0.0
     
+    # 구조 기반 손절용 (신규)
+    breakout_level: float = 0.0     # 돌파 기준가 (이 가격 아래로 복귀 시 손절)
+    vwap_at_entry: float = 0.0      # 진입 시점 VWAP (이탈 시 손절)
+    
     # 세부 점수
     score_breakdown: Dict[str, float] = field(default_factory=dict)
     
@@ -132,6 +136,8 @@ class ScalpSignal:
             'stop_loss': self.stop_loss,
             'take_profit_1': self.take_profit_1,
             'take_profit_2': self.take_profit_2,
+            'breakout_level': self.breakout_level,
+            'vwap_at_entry': self.vwap_at_entry,
             'score_breakdown': self.score_breakdown,
             'reason': self.reason,
             'warnings': self.warnings,
@@ -191,6 +197,39 @@ class ScalpSignalGenerator:
         self.min_score = trading_config.get('min_score', SignalParams.MIN_SCORE)
         self.min_score_conservative = self.min_score + 10
         
+        # 🆕 v3.2 Soft Scoring 설정
+        scoring_config = self.config.get('scoring', {})
+        penalties = scoring_config.get('penalties', {})
+        bonuses = scoring_config.get('bonuses', {})
+        
+        # 감점 설정
+        self.cci_overheat_threshold = penalties.get('cci_overheat_threshold', 150)
+        self.cci_overheat_penalty = penalties.get('cci_overheat_penalty', -10)
+        self.cci_extreme_threshold = penalties.get('cci_extreme_threshold', 200)
+        self.cci_extreme_penalty = penalties.get('cci_extreme_penalty', -20)
+        
+        self.rsi_overbought_threshold = penalties.get('rsi_overbought_threshold', 80)
+        self.rsi_overbought_penalty = penalties.get('rsi_overbought_penalty', -10)
+        self.rsi_extreme_threshold = penalties.get('rsi_extreme_threshold', 85)
+        self.rsi_extreme_penalty = penalties.get('rsi_extreme_penalty', -15)
+        
+        self.below_vwap_penalty = penalties.get('below_vwap_penalty', -15)
+        self.ema_bearish_penalty = penalties.get('ema_bearish_penalty', -5)
+        self.low_volume_threshold = penalties.get('low_volume_threshold', 1.5)
+        self.low_volume_penalty = penalties.get('low_volume_penalty', -10)
+        
+        # 가점 설정
+        self.ema_bullish_bonus = bonuses.get('ema_bullish', 10)
+        self.high_volume_threshold = bonuses.get('high_volume_threshold', 3.0)
+        self.high_volume_bonus = bonuses.get('high_volume_bonus', 15)
+        self.vwap_strong_threshold = bonuses.get('vwap_strong_threshold', 1.0)
+        self.vwap_strong_bonus = bonuses.get('vwap_strong_bonus', 10)
+        
+        # 🆕 v3.2 Hard Firewall 설정
+        firewall_config = self.config.get('hard_firewall', {})
+        self.min_volume_ratio = firewall_config.get('min_volume_ratio', 0.5)
+        self.max_day_change_pct = firewall_config.get('max_day_change_pct', 15.0)
+        
         # 전략 활성화 설정
         indicators_config = self.config.get('indicators', {})
         strategies_config = indicators_config.get('strategies', {})
@@ -220,7 +259,9 @@ class ScalpSignalGenerator:
         stock_name: str = "",
     ) -> ScalpSignal:
         """
-        시그널 평가
+        시그널 평가 (v3.2)
+        
+        구조: Hard Firewall → 전략 점수 → Soft Scoring → 최종 판정
         
         Args:
             stock_code: 종목 코드
@@ -246,8 +287,8 @@ class ScalpSignalGenerator:
             signal.reason = "긴급 모드 - 신규 진입 금지"
             return signal
         
-        # 기본 필터 체크
-        if not self._pass_basic_filters(indicators, context, signal):
+        # 🆕 v3.2 Hard Firewall (최소화: 거래량, 당일급등만)
+        if not self._pass_hard_firewall(indicators, context, signal):
             return signal
         
         # 각 전략 평가 (활성화된 전략만)
@@ -263,16 +304,26 @@ class ScalpSignalGenerator:
         
         best_signal = signal
         best_score = 0
+        best_breakdown = {}
+        best_warnings = []
         
         for strategy_fn in strategies:
             result = strategy_fn(indicators, context)
             if result['score'] > best_score:
                 best_score = result['score']
                 best_signal.signal_type = result['type']
-                best_signal.score = result['score']
-                best_signal.score_breakdown = result['breakdown']
+                best_breakdown = result['breakdown'].copy()
                 best_signal.reason = result['reason']
-                best_signal.warnings = result.get('warnings', [])
+                best_warnings = result.get('warnings', [])
+        
+        # 🆕 v3.2 Soft Scoring 적용 (CCI, RSI, VWAP, EMA 감점/가점)
+        final_score, final_breakdown, soft_warnings = self._apply_soft_scoring(
+            indicators, best_score, best_breakdown
+        )
+        
+        best_signal.score = final_score
+        best_signal.score_breakdown = final_breakdown
+        best_signal.warnings = best_warnings + soft_warnings
         
         # 최종 판정
         min_score = self.min_score_conservative if context.conservative_mode else self.min_score
@@ -285,6 +336,14 @@ class ScalpSignalGenerator:
             best_signal.stop_loss = indicators.price * (1 + self.stop_loss / 100)
             best_signal.take_profit_1 = indicators.price * (1 + self.take_profit_1 / 100)
             best_signal.take_profit_2 = indicators.price * (1 + self.take_profit_2 / 100)
+            
+            # 구조 기반 손절용 레벨 설정
+            if best_signal.signal_type == SignalType.BREAKOUT:
+                best_signal.breakout_level = indicators.day_high * 0.997
+            else:
+                best_signal.breakout_level = indicators.vwap * 0.995
+            
+            best_signal.vwap_at_entry = indicators.vwap
         else:
             best_signal.action = "HOLD"
             if best_signal.score > 0:
@@ -293,48 +352,127 @@ class ScalpSignalGenerator:
         return best_signal
     
     # =========================================================================
-    # 기본 필터
+    # 🆕 v3.2 Hard Firewall (최소화 - 4개만)
     # =========================================================================
     
-    def _pass_basic_filters(
+    def _pass_hard_firewall(
         self,
         indicators: MinuteIndicatorResult,
         context: MarketContext,
         signal: ScalpSignal,
     ) -> bool:
-        """기본 필터 통과 여부"""
+        """
+        Hard Firewall 통과 여부 (v3.2)
         
-        # 1. VWAP 위 체크 (선택적)
-        if SignalParams.VWAP_ABOVE_REQUIRED and indicators.vwap_distance < 0:
+        최소한의 절대 조건만 체크:
+        1. 거래량 0.5배 이상 (유동성)
+        2. 당일 +15% 미만 (상한가 위험)
+        
+        나머지(CCI, RSI, VWAP, EMA)는 점수화!
+        """
+        
+        # 1. 거래량 체크 (유동성 - 절대 필요)
+        if indicators.volume_ratio < self.min_volume_ratio:
             signal.action = "SKIP"
-            signal.reason = f"VWAP 아래 ({indicators.vwap_distance:.2f}%)"
+            signal.reason = f"[HARD] 거래량 부족 ({indicators.volume_ratio:.2f}x < {self.min_volume_ratio}x)"
             return False
         
-        # 2. RSI 과매수 체크
-        if indicators.rsi > 85:
+        # 2. 당일 급등 체크 (상한가 위험)
+        if indicators.day_change_pct > self.max_day_change_pct:
             signal.action = "SKIP"
-            signal.reason = f"RSI 과매수 ({indicators.rsi:.1f})"
-            return False
-        
-        # 3. CCI 극과열 체크
-        if indicators.cci > 300:
-            signal.action = "SKIP"
-            signal.reason = f"CCI 극과열 ({indicators.cci:.0f})"
-            return False
-        
-        # 4. 거래량 체크 (너무 적으면 스킵)
-        if indicators.volume_ratio < 0.5:
-            signal.action = "SKIP"
-            signal.reason = f"거래량 부족 ({indicators.volume_ratio:.2f}x)"
-            return False
-        
-        # 5. 당일 급등 체크 (이미 많이 올랐으면)
-        if indicators.day_change_pct > 15:
-            signal.action = "SKIP"
-            signal.reason = f"당일 급등 ({indicators.day_change_pct:.1f}%)"
+            signal.reason = f"[HARD] 당일 급등 ({indicators.day_change_pct:.1f}% > {self.max_day_change_pct}%)"
             return False
         
         return True
+    
+    # =========================================================================
+    # 🆕 v3.2 Soft Scoring (감점/가점)
+    # =========================================================================
+    
+    def _apply_soft_scoring(
+        self,
+        indicators: MinuteIndicatorResult,
+        base_score: float,
+        breakdown: Dict[str, float],
+    ) -> Tuple[float, Dict[str, float], List[str]]:
+        """
+        Soft Scoring 적용 (v3.2)
+        
+        기존 하드 필터 → 점수화:
+        - CCI 과열 → 감점
+        - RSI 과매수 → 감점
+        - VWAP 아래 → 감점
+        - EMA 역배열 → 감점
+        - 거래량 부족 → 감점
+        
+        가점:
+        - EMA 정배열 → 가점
+        - 거래량 폭증 → 가점
+        - VWAP 상방 강함 → 가점
+        """
+        score = base_score
+        warnings = []
+        
+        # === 감점 ===
+        
+        # CCI 과열
+        if indicators.cci >= self.cci_extreme_threshold:
+            score += self.cci_extreme_penalty
+            breakdown['CCI극과열'] = self.cci_extreme_penalty
+            warnings.append(f"CCI {indicators.cci:.0f} (극과열)")
+        elif indicators.cci >= self.cci_overheat_threshold:
+            score += self.cci_overheat_penalty
+            breakdown['CCI과열'] = self.cci_overheat_penalty
+            warnings.append(f"CCI {indicators.cci:.0f} (과열)")
+        
+        # RSI 과매수
+        if indicators.rsi >= self.rsi_extreme_threshold:
+            score += self.rsi_extreme_penalty
+            breakdown['RSI극과열'] = self.rsi_extreme_penalty
+            warnings.append(f"RSI {indicators.rsi:.1f} (극과열)")
+        elif indicators.rsi >= self.rsi_overbought_threshold:
+            score += self.rsi_overbought_penalty
+            breakdown['RSI과매수'] = self.rsi_overbought_penalty
+            warnings.append(f"RSI {indicators.rsi:.1f} (과매수)")
+        
+        # VWAP 아래
+        if indicators.vwap_distance < 0:
+            score += self.below_vwap_penalty
+            breakdown['VWAP아래'] = self.below_vwap_penalty
+            warnings.append(f"VWAP 아래 ({indicators.vwap_distance:.2f}%)")
+        
+        # EMA 역배열
+        if indicators.ema9 > 0 and indicators.ema20 > 0:
+            if indicators.ema9 < indicators.ema20:
+                score += self.ema_bearish_penalty
+                breakdown['EMA역배열'] = self.ema_bearish_penalty
+                warnings.append("EMA 역배열")
+        
+        # 거래량 부족 (0.5~1.5 사이)
+        if indicators.volume_ratio < self.low_volume_threshold:
+            score += self.low_volume_penalty
+            breakdown['거래량부족'] = self.low_volume_penalty
+            warnings.append(f"거래량 {indicators.volume_ratio:.1f}x (부족)")
+        
+        # === 가점 ===
+        
+        # EMA 정배열
+        if indicators.ema9 > 0 and indicators.ema20 > 0:
+            if indicators.ema9 >= indicators.ema20:
+                score += self.ema_bullish_bonus
+                breakdown['EMA정배열'] = self.ema_bullish_bonus
+        
+        # 거래량 폭증
+        if indicators.volume_ratio >= self.high_volume_threshold:
+            score += self.high_volume_bonus
+            breakdown['거래량폭증'] = self.high_volume_bonus
+        
+        # VWAP 상방 강함
+        if indicators.vwap_distance >= self.vwap_strong_threshold:
+            score += self.vwap_strong_bonus
+            breakdown['VWAP강함'] = self.vwap_strong_bonus
+        
+        return max(0, score), breakdown, warnings
     
     # =========================================================================
     # 전략 1: 돌파 매수 (Breakout)
@@ -382,24 +520,16 @@ class ScalpSignalGenerator:
             score += 8
             breakdown['거래량보통'] = 8
         
-        # 4. CCI 모멘텀 (150 이상은 과열 → 스킵)
-        if indicators.cci >= 150:
-            # CCI 과열 시 돌파 매수 부적합
-            return {
-                'type': SignalType.BREAKOUT,
-                'score': 0,
-                'breakdown': {'CCI과열': 0},
-                'reason': f"CCI 과열 ({indicators.cci:.0f}) - 돌파 스킵",
-                'warnings': ["CCI 150 이상 과열 상태"],
-            }
-        elif indicators.cci >= SignalParams.BREAKOUT_CCI_MIN:
+        # 4. CCI 모멘텀 (v3.2: 차단 제거, 감점은 Soft Scoring에서 처리)
+        if indicators.cci >= SignalParams.BREAKOUT_CCI_MIN:
             score += 15
             breakdown['CCI적정'] = 15
         elif indicators.cci >= 50:
             score += 8
             breakdown['CCI약함'] = 8
+        # CCI 과열 감점은 _apply_soft_scoring에서 처리
         
-        # 5. RSI 적정 (과열 아님)
+        # 5. RSI 적정 (v3.2: 차단 제거, 감점은 Soft Scoring에서 처리)
         if 50 <= indicators.rsi <= 70:
             score += 10
             breakdown['RSI적정'] = 10
@@ -407,23 +537,23 @@ class ScalpSignalGenerator:
             score += 5
             breakdown['RSI낮음'] = 5
             warnings.append("RSI가 낮아 모멘텀 부족 가능")
-        elif indicators.rsi > SignalParams.BREAKOUT_RSI_MAX:
-            score -= 10
-            breakdown['RSI과열'] = -10
-            warnings.append("RSI 과매수 구간")
+        # RSI 과열 감점은 _apply_soft_scoring에서 처리
         
-        # 6. VWAP 위치
+        # 6. VWAP 위치 (v3.2: VWAP 아래도 진입 가능, 감점은 Soft Scoring에서)
         if indicators.vwap_distance > 1.0:
             score += 10
             breakdown['VWAP상방'] = 10
         elif indicators.vwap_distance > 0:
             score += 5
             breakdown['VWAP위'] = 5
+        # VWAP 아래 감점은 _apply_soft_scoring에서 처리
         
         # 7. 양봉 확인
         if indicators.is_bullish and indicators.body_ratio > 0.5:
             score += 5
             breakdown['강한양봉'] = 5
+        
+        # EMA 정배열/역배열은 _apply_soft_scoring에서 처리
         
         return {
             'type': SignalType.BREAKOUT,
@@ -499,34 +629,31 @@ class ScalpSignalGenerator:
             breakdown['거래량증가'] = -5
             warnings.append("조정 시 거래량 증가 - 매도 압력")
         
-        # 4. RSI 체크
+        # 4. RSI 체크 (v3.2: 가점만, 감점은 Soft Scoring)
         if indicators.rsi >= SignalParams.PULLBACK_RSI_MIN:
             score += 10
             breakdown['RSI유지'] = 10
-        else:
-            score -= 5
-            breakdown['RSI약함'] = -5
-            warnings.append("RSI 하락 - 추세 약화")
+        # RSI 감점은 _apply_soft_scoring에서 처리
         
-        # 5. VWAP 위치
+        # 5. VWAP 위치 (v3.2: 가점만, 감점은 Soft Scoring)
         if indicators.vwap_distance > 0.5:
             score += 15
             breakdown['VWAP상방'] = 15
         elif indicators.vwap_distance > 0:
             score += 10
             breakdown['VWAP위'] = 10
-        else:
-            score -= 10
-            breakdown['VWAP아래'] = -10
-            warnings.append("VWAP 아래로 이탈")
+        # VWAP 아래 감점은 _apply_soft_scoring에서 처리
         
-        # 6. CCI 체크
+        # 6. CCI 체크 (v3.2: 가점만)
         if 50 <= indicators.cci <= 150:
             score += 10
             breakdown['CCI적정'] = 10
         elif indicators.cci > 150:
             score += 5
             breakdown['CCI강함'] = 5
+        # CCI 과열 감점은 _apply_soft_scoring에서 처리
+        
+        # EMA 정배열/역배열은 _apply_soft_scoring에서 처리
         
         return {
             'type': SignalType.PULLBACK,

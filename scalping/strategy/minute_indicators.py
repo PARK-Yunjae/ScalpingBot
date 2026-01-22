@@ -36,7 +36,7 @@ logger = logging.getLogger('ScalpingBot.MinuteIndicators')
 
 CCI_PERIOD = 14          # CCI 기간 (5분봉 14개 = 70분)
 RSI_PERIOD = 14          # RSI 기간
-EMA_PERIODS = [5, 10, 20]  # EMA 기간들
+EMA_PERIODS = [5, 9, 10, 20]  # EMA 기간들 (9/20 추세 확인용 추가)
 VOLUME_AVG_PERIOD = 10   # 거래량 평균 기간
 
 
@@ -87,6 +87,7 @@ class MinuteIndicatorResult:
     
     # 추세 지표
     ema5: float = 0.0
+    ema9: float = 0.0       # EMA 9 (단기 추세)
     ema10: float = 0.0
     ema20: float = 0.0
     
@@ -115,6 +116,7 @@ class MinuteIndicatorResult:
             'cci': self.cci,
             'rsi': self.rsi,
             'ema5': self.ema5,
+            'ema9': self.ema9,
             'ema10': self.ema10,
             'ema20': self.ema20,
             'vwap': self.vwap,
@@ -256,6 +258,7 @@ class MinuteIndicators:
         
         # EMA
         result.ema5 = self._calc_ema(5)
+        result.ema9 = self._calc_ema(9)
         result.ema10 = self._calc_ema(10)
         result.ema20 = self._calc_ema(20)
         

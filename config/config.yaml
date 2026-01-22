@@ -1,5 +1,10 @@
 # ============================================================================
-# ScalpingBot v3.0 설정 파일
+# ScalpingBot v3.2 설정 파일
+# ============================================================================
+# v3.2 핵심 변경: "후보는 넓게, 실행은 엄격하게"
+# - Hard Filter 최소화 (4개만)
+# - 나머지는 점수화 (Soft Scoring)
+# - Adaptive Mode (시장/성과에 따라 자동 조절)
 # ============================================================================
 # 거래 비용: 슬리피지 0.30% + 수수료 0.03% + 세금 0.18% = 0.51%
 # 손익분기 승률: 55%
@@ -38,46 +43,147 @@ ai:
   use_for_universe: true
   use_for_news: true
   use_for_review: true
-  use_for_quick_filter: true   # 장중 AI 필터 (테스트 중)
+  use_for_quick_filter: true
 
 # -----------------------------------------
 # 매매 전략
 # -----------------------------------------
 trading:
-  # 손절/익절 (슬리피지 0.3% + 비용 0.2% 감안)
-  stop_loss: -0.8              # -1.2 → -0.8 (실제 -1.1%)
-  take_profit_1: 2.5           # 2.0 → 2.5 (분위기 좋을 때)
-  take_profit_2: 3.5           # 3.0 → 3.5
+  # 손절/익절
+  stop_loss: -0.8
+  take_profit_1: 2.5
+  take_profit_2: 3.5
   
-  # 기술적 필터 (MACD OR RSI) - OR 조건으로 완화됨
-  use_technical_filter: true
-  
-  # 트레일링 스탑 (net 기준으로 발동)
+  # 트레일링 스탑
   trailing:
     enabled: true
-    activation: 1.2            # 0.8 → 1.2 (net +0.7% 이상)
-    distance: 0.8              # 0.5 → 0.8 (여유있게)
+    activation: 1.2
+    distance: 0.8
   
-  # 시간 손절 (0% 청산 방지)
+  # 시간 손절
   time_stop:
     enabled: true
-    no_profit_minutes: 12      # 7 → 12분
-    no_profit_threshold: 0.7   # 0.2 → 0.7% (비용 커버)
-    max_hold_minutes: 20       # 15 → 20분
+    no_profit_minutes: 12
+    no_profit_threshold: 0.7
+    max_hold_minutes: 20
   
   # 시간 설정
   market_open: "09:05"
-  market_close: "15:07"        # 15:15 → 15:07 (시간손절 12분 + 여유)
-  force_close_time: "15:07"    # 14:50 → 15:07
+  market_close: "15:07"
+  force_close_time: "15:07"
 
-  # 점심시간 매수 금지
-  lunch_break_enabled: true
-  lunch_break_start: "12:00"
-  lunch_break_end: "13:00"     # 13:00 → 13:30으로 변경 가능
+# ============================================================================
+# 🆕 v3.2 점수 시스템 (Soft Scoring)
+# ============================================================================
+# 기존 하드 필터 → 점수화 (0매매 방지)
+# Hard Firewall 통과 후, 점수로 진입 여부 결정
+# ============================================================================
+scoring:
+  # 감점 항목 (기존 하드 필터 → 점수로 전환)
+  penalties:
+    # CCI 과열 (기존: 150 이상 차단 → 점수화)
+    cci_overheat_threshold: 150
+    cci_overheat_penalty: -10
+    cci_extreme_threshold: 200
+    cci_extreme_penalty: -20
+    
+    # RSI 과매수 (기존: 80 이상 차단 → 점수화)
+    rsi_overbought_threshold: 80
+    rsi_overbought_penalty: -10
+    rsi_extreme_threshold: 85
+    rsi_extreme_penalty: -15
+    
+    # VWAP 아래 (기존: 차단 → 점수화)
+    below_vwap_penalty: -15
+    
+    # EMA 역배열 (유지)
+    ema_bearish_penalty: -5
+    
+    # 거래량 부족 (1.5배 미만)
+    low_volume_threshold: 1.5
+    low_volume_penalty: -10
   
-  # 진입 점수 (거래 빈도↓, 기대값↑)
-  min_score: 70                # 65 → 70
-  min_score_conservative: 75   # 70 → 75
+  # 가점 항목
+  bonuses:
+    ema_bullish: 10           # EMA 정배열
+    high_volume_threshold: 3.0
+    high_volume_bonus: 15     # 거래량 3배 이상
+    vwap_strong_threshold: 1.0
+    vwap_strong_bonus: 10     # VWAP +1% 이상
+
+# ============================================================================
+# 🆕 v3.2 Hard Firewall (절대 조건 - 최소화!)
+# ============================================================================
+# 이 4가지만 통과하면 됨 (나머지는 점수로)
+# ============================================================================
+hard_firewall:
+  # 1. 거래량 최소 조건 (유동성)
+  min_volume_ratio: 0.5       # 평균 대비 0.5배 이상
+  
+  # 2. 당일 급등 제한 (상한가 위험)
+  max_day_change_pct: 15.0    # +15% 이상은 진입 금지
+  
+  # 3. 점심시간 회피
+  lunch_break_enabled: true
+  lunch_start: "12:00"
+  lunch_end: "13:00"
+  
+  # 4. 이미 보유 중인 종목 (중복 매수 금지)
+  # → 코드에서 자동 체크
+
+# ============================================================================
+# 🆕 v3.2 Adaptive Mode (자동 강약 조절)
+# ============================================================================
+# 시장 상황 + 봇 성과에 따라 min_score, 쿨타임 등 자동 조정
+# ============================================================================
+adaptive_mode:
+  enabled: true
+  default_mode: "BALANCED"
+  
+  # 모드별 설정
+  modes:
+    DEFENSIVE:
+      min_score: 75
+      cooldown_minutes: 15
+      description: "방어 모드 - 확실한 것만"
+    BALANCED:
+      min_score: 70
+      cooldown_minutes: 10
+      description: "균형 모드 - 기본값"
+    AGGRESSIVE:
+      min_score: 65
+      cooldown_minutes: 5
+      description: "공격 모드 - 기회 확대"
+  
+  # 모드 전환 트리거
+  triggers:
+    # DEFENSIVE 전환 조건
+    to_defensive:
+      consecutive_losses: 3         # 3연패 시
+      index_drop_pct: -1.5          # 지수 -1.5% 이상 하락 시
+      daily_loss_pct: -1.5          # 당일 손실 -1.5% 이상 시
+    
+    # AGGRESSIVE 전환 조건
+    to_aggressive:
+      daily_profit_pct: 1.0         # 당일 수익 +1% 이상
+      consecutive_wins: 3           # 3연승 시
+      index_rise_pct: 1.0           # 지수 +1% 이상 상승 시
+    
+    # BALANCED 복귀 조건
+    to_balanced:
+      from_defensive_wins: 2        # DEFENSIVE에서 2연승 시
+      from_aggressive_losses: 2     # AGGRESSIVE에서 2연패 시
+
+# ============================================================================
+# 🆕 v3.2 퍼널 로그 (탈락 추적)
+# ============================================================================
+# "왜 0매매인지" 단계별 추적
+# ============================================================================
+funnel_log:
+  enabled: true
+  log_interval_minutes: 10        # 10분마다 퍼널 요약
+  discord_notify: true            # Discord로 퍼널 요약 전송
+  show_top_candidates: 5          # 상위 5개 후보 항상 표시
 
 # -----------------------------------------
 # 분봉 지표
@@ -88,17 +194,18 @@ indicators:
   rsi_period: 14
   volume_avg_period: 10
   
-  # 전략 활성화 (vwap_bounce는 슬리피지에 취약)
+  # 전략 활성화
   strategies:
     breakout: true
     pullback: true
     gap_play: true
-    vwap_bounce: false         # 비활성화 (떨어지는 칼날 금지)
+    vwap_bounce: false
   
+  # 돌파 전략 (cci_max 제거 - 점수화로 전환)
   breakout:
     cci_min: 100
-    cci_max: 150       # ★ CCI 150 이상이면 이미 과열 → 진입 금지
-    rsi_max: 70        # RSI 70으로 하향 (80은 과매수)
+    # cci_max: 삭제됨 (점수로 전환)
+    rsi_max: 70
     volume_min: 2.0
   
   pullback:
@@ -116,32 +223,49 @@ indicators:
 # -----------------------------------------
 safety:
   max_positions: 3
-  max_position_size: 130000     # 종목당 13만원
-  max_total_exposure: 450000    # 총 45 만원
+  max_position_size: 130000
+  max_total_exposure: 450000
   
-  max_daily_loss: -15000        # 일일 -1.5만원
+  max_daily_loss: -15000
   max_daily_loss_pct: -3.0
   max_daily_trades: 20
   
-  consecutive_loss_rest: 3      # 3연패 → 10분 휴식 ✅ 이제 작동함!
+  consecutive_loss_rest: 3        # 3연패 → DEFENSIVE 모드 전환
   rest_minutes: 10
-  consecutive_loss_stop: 7      # 7연패 → 당일 중단 + 프로그램 종료
+  consecutive_loss_stop: 7        # 7연패 → 당일 중단 + 프로그램 종료
   
   index_emergency_threshold: -2.5
   index_conservative_threshold: -1.5
 
 # -----------------------------------------
-# 유니버스 (시총: 250억 ~ 10조)
+# 구조 기반 손절
+# -----------------------------------------
+structure_stop:
+  enabled: true
+  breakout_stop: true
+  vwap_stop: true
+
+# -----------------------------------------
+# EMA 설정
+# -----------------------------------------
+ema:
+  fast_period: 9
+  slow_period: 20
+  use_ema_filter: true
+
+# -----------------------------------------
+# 유니버스 (TV100만 사용 - 단순화)
 # -----------------------------------------
 universe:
   condition_name: "TV100"
   target_size: 50
   min_price: 3000
-  max_price: 50000              # 5만원 이하 (스캘핑 적합)
+  max_price: 50000
   min_volume: 500000
-  min_market_cap: 25000000000   # 250억 (0.25조)
-  max_market_cap: 10000000000000 # 10조
-  refresh_interval: 10          # 장중 갱신 주기 (분)
+  # 거래대금 필터 제거 (TV100이면 충분)
+  min_market_cap: 25000000000
+  max_market_cap: 10000000000000
+  refresh_interval: 10
   
   prev_day:
     min_change_pct: 0.5
@@ -192,3 +316,5 @@ discord:
     time_stop: true
     emergency: true
     daily_report: true
+    mode_change: true             # 🆕 모드 전환 알림
+    funnel_summary: true          # 🆕 퍼널 요약 알림
