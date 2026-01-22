@@ -59,6 +59,14 @@ NEWS_PER_STOCK = 5             # 종목당 뉴스 N개
 MIN_MARKET_CAP = 50_000_000_000   # 최소 시총 500억
 MAX_MARKET_CAP = 3_000_000_000_000  # 최대 시총 3조
 
+# 제외 종목 패턴 (ETF, ETN, 스팩, 우선주 등)
+EXCLUDE_PATTERNS = [
+    'ETF', 'ETN', 'KODEX', 'TIGER', 'KBSTAR', 'ARIRANG', 
+    'HANARO', 'SOL', '스팩', 'SPAC', '리츠', 'RISE', 'ACE',
+    'KOSEF', 'TIMEFOLIO', 'PLUS', 'WOORI', 'KB',
+    '우', '우B', '1우', '2우', '3우', '우선주', '인버스', '레버리지'
+]
+
 
 # =============================================================================
 # 데이터 클래스
@@ -250,11 +258,22 @@ class PreMarketAnalyzer:
         config: Dict[str, Any],
         broker = None,
         ai_engine = None,
+        secrets: Dict[str, Any] = None,
     ):
         self.config = config
         self.broker = broker
         self.ai_engine = ai_engine
-        self.news_collector = NewsCollector()
+        
+        # secrets에서 네이버 API 키 로드
+        secrets = secrets or {}
+        naver_config = secrets.get('naver', {})
+        naver_client_id = naver_config.get('client_id', '') or NAVER_CLIENT_ID
+        naver_client_secret = naver_config.get('client_secret', '') or NAVER_CLIENT_SECRET
+        
+        self.news_collector = NewsCollector(
+            client_id=naver_client_id,
+            client_secret=naver_client_secret,
+        )
         
         # 결과 저장
         self._result: Optional[PreMarketResult] = None
@@ -282,9 +301,13 @@ class PreMarketAnalyzer:
             
             # 2. 뉴스 수집
             logger.info("\n[2/5] 뉴스/공시 수집...")
-            for stock in volume_top:
+            # 상위 15개만 뉴스 수집 (rate limit 회피)
+            import time as time_module
+            for i, stock in enumerate(volume_top[:15]):
                 stock.news = self.news_collector.collect_stock_news(stock.name)
                 logger.debug(f"   - {stock.name}: 뉴스 {len(stock.news)}건")
+                if i < len(volume_top[:15]) - 1:
+                    time_module.sleep(0.15)  # 150ms 딜레이로 rate limit 회피
             
             # 3. 차트 분석 (이격도, 지지/저항)
             logger.info("\n[3/5] 차트 분석...")
@@ -308,6 +331,23 @@ class PreMarketAnalyzer:
             logger.info(f"✅ 분석 완료: {len(result.selected_stocks)}개 종목 선정")
             logger.info("=" * 60)
             
+            # 선정 종목 로그 출력
+            if result.selected_stocks:
+                logger.info("\n📋 선정 종목:")
+                for i, stock in enumerate(result.selected_stocks, 1):
+                    score = getattr(stock, 'ai_score', 0)
+                    logger.info(f"   {i}. {stock.name} ({stock.code}) - {score:.0f}점")
+            
+            # 회피 종목 로그 출력
+            if result.avoid_stocks:
+                logger.info("\n⚠️ 회피 종목:")
+                for item in result.avoid_stocks[:3]:
+                    # AI 응답이 dict 형식: {"name": "종목명", "reason": "이유"}
+                    if isinstance(item, dict):
+                        logger.info(f"   - {item.get('name', '?')}: {item.get('reason', '')}")
+                    else:
+                        logger.info(f"   - {item.name}: {getattr(item, 'ai_analysis', {}).get('avoid_reason', '')}")
+            
         except Exception as e:
             logger.error(f"분석 실패: {e}")
             import traceback
@@ -317,7 +357,7 @@ class PreMarketAnalyzer:
         return result
     
     async def _get_volume_top_stocks(self) -> List[StockInfo]:
-        """거래량 상위 종목 조회"""
+        """거래량 상위 종목 조회 (TV100 조건검색 사용)"""
         stocks = []
         
         if not self.broker:
@@ -325,11 +365,48 @@ class PreMarketAnalyzer:
             return stocks
         
         try:
-            # 조건검색 또는 거래량 상위 조회
-            # 실제 구현 시 broker.get_volume_ranking() 호출
+            # TV100 조건검색 사용
+            condition_name = self.config.get('universe', {}).get('condition_name', 'TV100')
+            condition_result = self.broker.get_condition_stocks(condition_name)
             
-            # TODO: 실제 구현
-            pass
+            if not condition_result:
+                logger.warning(f"조건검색 '{condition_name}' 결과 없음")
+                return stocks
+            
+            logger.info(f"   조건검색 '{condition_name}' 결과: {len(condition_result)}개")
+            
+            # 가격 필터 적용
+            universe_config = self.config.get('universe', {})
+            min_price = universe_config.get('min_price', 3000)
+            max_price = universe_config.get('max_price', 50000)
+            
+            for item in condition_result[:VOLUME_TOP_COUNT]:
+                code = item.get('code', '')
+                name = item.get('name', '')
+                price = float(item.get('price', 0))
+                volume = int(item.get('volume', 0))
+                change_pct = float(item.get('change_pct', 0))
+                
+                # 가격 필터
+                if not (min_price <= price <= max_price):
+                    continue
+                
+                # ETF/스팩/우선주 필터 (종목명 기반)
+                if any(pattern in name for pattern in EXCLUDE_PATTERNS):
+                    logger.debug(f"   제외: {name} (ETF/스팩/우선주)")
+                    continue
+                
+                stock = StockInfo(
+                    code=code,
+                    name=name,
+                    price=price,
+                    prev_close=price / (1 + change_pct / 100) if change_pct != -100 else price,
+                    change_pct=change_pct,
+                    volume=volume,
+                )
+                stocks.append(stock)
+            
+            logger.info(f"   → 가격 필터 후: {len(stocks)}개")
             
         except Exception as e:
             logger.error(f"거래량 상위 조회 실패: {e}")
@@ -391,11 +468,22 @@ class PreMarketAnalyzer:
         prompt = self._build_ai_prompt(stocks, sector_flows)
         
         try:
-            # AI 호출
-            response = await self.ai_engine.generate(prompt)
+            # AI 호출 (비동기, JSON 모드)
+            # AI 호출 (비동기) - JSON 모드 비활성화 (더 안정적)
+            response = await self.ai_engine.generate_async(prompt, max_tokens=16000, json_mode=False)
+            
+            # 응답 로그 (디버깅용)
+            logger.info(f"   🤖 AI 응답 길이: {len(response)}자")
+            logger.debug(f"   AI 응답: {response[:500]}...")
             
             # JSON 파싱
-            result = self._parse_ai_response(response)
+            result = self._parse_ai_response(response, stocks)
+            
+            # 파싱 결과가 비어있으면 규칙 기반으로
+            if not result.get('selected'):
+                logger.warning("   AI 응답 파싱 결과 없음 - 규칙 기반 선정")
+                return self._rule_based_selection(stocks)
+            
             return result
             
         except Exception as e:
@@ -519,26 +607,174 @@ class PreMarketAnalyzer:
 ```
 
 상위 5개 종목만 선정하고, 피해야 할 종목은 2~3개만 명시해라.
+
+**중요: 반드시 위 JSON 형식으로만 응답해라. 추가 설명이나 서론 없이 순수 JSON만 출력해라.**
 """
         return prompt
     
-    def _parse_ai_response(self, response: str) -> Dict[str, Any]:
+    def _parse_ai_response(self, response: str, stocks: List[StockInfo] = None) -> Dict[str, Any]:
         """AI 응답 파싱"""
+        stocks = stocks or []
+        stock_map = {s.code: s for s in stocks}
+        stock_name_map = {s.name: s for s in stocks}
+        
         try:
-            # JSON 블록 추출
-            json_match = re.search(r'```json\s*(.*?)\s*```', response, re.DOTALL)
-            if json_match:
-                json_str = json_match.group(1)
-            else:
-                # JSON 블록 없으면 전체에서 시도
-                json_str = response
+            # JSON 블록 추출 시도
+            json_str = None
+            response_stripped = response.strip()
             
+            # 0. 순수 JSON인 경우 (json_mode=True 응답)
+            if response_stripped.startswith('{'):
+                if response_stripped.endswith('}'):
+                    json_str = response_stripped
+                    logger.debug("순수 JSON 응답 감지")
+                else:
+                    # 불완전한 JSON - 복구 시도
+                    json_str = self._repair_truncated_json(response_stripped)
+                    if json_str:
+                        logger.warning("⚠️ 잘린 JSON 복구 시도")
+            
+            # 1. ```json ... ``` 블록
+            if not json_str:
+                json_match = re.search(r'```json\s*(.*?)\s*```', response, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(1)
+            
+            # 2. ``` ... ``` 블록 (json 명시 없음)
+            if not json_str:
+                json_match = re.search(r'```\s*(.*?)\s*```', response, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(1)
+            
+            # 3. { ... } 블록 직접 추출 (마지막 } 찾기)
+            if not json_str:
+                start_idx = response.find('{')
+                end_idx = response.rfind('}')
+                if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                    json_str = response[start_idx:end_idx + 1]
+                elif start_idx != -1:
+                    # }가 없으면 복구 시도
+                    json_str = self._repair_truncated_json(response[start_idx:])
+            
+            if not json_str:
+                logger.error(f"JSON 블록을 찾을 수 없음. 응답: {response[:300]}...")
+                return {'selected': [], 'avoid': [], 'market_summary': ''}
+            
+            # JSON 파싱
             result = json.loads(json_str)
-            return result
             
+            # selected 항목을 StockInfo로 변환
+            selected_stocks = []
+            for item in result.get('selected', []):
+                code = item.get('code', '')
+                name = item.get('name', '')
+                
+                # StockInfo 찾기
+                stock = stock_map.get(code) or stock_name_map.get(name)
+                
+                if stock:
+                    # AI 점수 및 분석 결과 저장
+                    stock.ai_score = item.get('total_score', 70)
+                    stock.ai_analysis = {
+                        'scores': item.get('scores', {}),
+                        'material_summary': item.get('material_summary', ''),
+                        'sentiment_summary': item.get('sentiment_summary', ''),
+                        'volume_summary': item.get('volume_summary', ''),
+                        'chart_summary': item.get('chart_summary', ''),
+                        'scenarios': item.get('scenarios', {}),
+                        'risk': item.get('risk', ''),
+                    }
+                    selected_stocks.append(stock)
+                else:
+                    logger.warning(f"   종목 찾기 실패: {code} / {name}")
+            
+            logger.info(f"   ✅ AI 선정: {len(selected_stocks)}개 종목")
+            
+            return {
+                'selected': selected_stocks,
+                'avoid': result.get('avoid', []),
+                'market_summary': result.get('market_summary', ''),
+                'scenarios': {},
+            }
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"AI 응답 JSON 파싱 실패: {e}")
+            logger.error(f"   파싱 시도한 문자열: {json_str[:200] if json_str else 'None'}...")
+            return {'selected': [], 'avoid': [], 'market_summary': ''}
         except Exception as e:
             logger.error(f"AI 응답 파싱 실패: {e}")
             return {'selected': [], 'avoid': [], 'market_summary': ''}
+    
+    def _repair_truncated_json(self, json_str: str) -> Optional[str]:
+        """
+        잘린 JSON 복구 시도
+        
+        Gemini가 max_tokens 제한으로 응답이 잘렸을 때,
+        최소한 파싱 가능한 형태로 복구를 시도합니다.
+        """
+        if not json_str or not json_str.strip().startswith('{'):
+            return None
+        
+        try:
+            # 이미 유효한 JSON인지 확인
+            json.loads(json_str)
+            return json_str
+        except json.JSONDecodeError:
+            pass
+        
+        # 복구 시도
+        repaired = json_str.strip()
+        
+        # 열린 괄호 카운트
+        brace_count = 0
+        bracket_count = 0
+        in_string = False
+        escape_next = False
+        
+        for char in repaired:
+            if escape_next:
+                escape_next = False
+                continue
+            if char == '\\':
+                escape_next = True
+                continue
+            if char == '"' and not escape_next:
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if char == '{':
+                brace_count += 1
+            elif char == '}':
+                brace_count -= 1
+            elif char == '[':
+                bracket_count += 1
+            elif char == ']':
+                bracket_count -= 1
+        
+        # 닫히지 않은 괄호 닫기
+        # 먼저 문자열이 열려있으면 닫기
+        if in_string:
+            repaired += '"'
+        
+        # 불완전한 값 정리 (마지막 쉼표나 콜론 뒤 잘림)
+        repaired = repaired.rstrip()
+        if repaired.endswith(','):
+            repaired = repaired[:-1]
+        if repaired.endswith(':'):
+            repaired += 'null'
+        
+        # 배열/객체 닫기
+        repaired += ']' * bracket_count
+        repaired += '}' * brace_count
+        
+        try:
+            json.loads(repaired)
+            logger.info(f"   ✅ JSON 복구 성공 (추가: {']' * bracket_count + '}' * brace_count})")
+            return repaired
+        except json.JSONDecodeError as e:
+            logger.warning(f"   JSON 복구 실패: {e}")
+            return None
     
     def _rule_based_selection(self, stocks: List[StockInfo]) -> Dict[str, Any]:
         """규칙 기반 종목 선정 (AI 실패 시 백업)"""

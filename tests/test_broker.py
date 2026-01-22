@@ -18,7 +18,8 @@ from unittest.mock import Mock, patch, MagicMock
 from datetime import datetime, timedelta
 
 import sys
-sys.path.insert(0, '/home/claude/ScalpingBot')
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scalping.execution.broker import KISBroker
 

@@ -9,7 +9,7 @@ ScalpingBot v2.4 - Logger (로깅 시스템)
 핵심 기능:
 - 일별 로그 파일 로테이션
 - 에러 전용 로그 파일 (errors.log)
-- 콘솔 컬러 출력
+- 콘솔 컬러 출력 (Windows 호환)
 - 스택 트레이스 자동 포함
 - 로그 레벨 동적 변경
 
@@ -39,6 +39,22 @@ from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
 from typing import Optional, Dict
 import threading
 
+# Windows 콘솔 색상 지원
+try:
+    import colorama
+    colorama.init(autoreset=True)
+    COLORAMA_AVAILABLE = True
+except ImportError:
+    COLORAMA_AVAILABLE = False
+    # Windows에서 ANSI 이스케이프 활성화 시도
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+        except Exception:
+            pass
+
 # 전역 설정
 _initialized = False
 _log_dir: Optional[Path] = None
@@ -50,28 +66,39 @@ _lock = threading.Lock()
 # =============================================================================
 
 class ColorFormatter(logging.Formatter):
-    """콘솔 컬러 포맷터"""
+    """콘솔 컬러 포맷터 (Windows 호환)"""
     
     # ANSI 컬러 코드
     COLORS = {
-        'DEBUG': '\033[36m',     # Cyan
-        'INFO': '\033[32m',      # Green
-        'WARNING': '\033[33m',   # Yellow
-        'ERROR': '\033[31m',     # Red
-        'CRITICAL': '\033[35m',  # Magenta
+        'DEBUG': '\033[36m',     # Cyan (청록)
+        'INFO': '\033[92m',      # Bright Green (밝은 녹색)
+        'WARNING': '\033[93m',   # Bright Yellow (밝은 노랑)
+        'ERROR': '\033[91m',     # Bright Red (밝은 빨강)
+        'CRITICAL': '\033[95m',  # Bright Magenta (밝은 자홍)
     }
     RESET = '\033[0m'
     BOLD = '\033[1m'
     
+    # 레벨별 아이콘
+    ICONS = {
+        'DEBUG': '🔍',
+        'INFO': '✅',
+        'WARNING': '⚠️',
+        'ERROR': '❌',
+        'CRITICAL': '🔥',
+    }
+    
     def format(self, record):
-        # 레벨별 컬러
+        # 레벨별 컬러와 아이콘
         color = self.COLORS.get(record.levelname, '')
+        icon = self.ICONS.get(record.levelname, '')
         
         # 원본 포맷
         original = super().format(record)
         
         # 컬러 적용
         if color:
+            # 전체 라인에 색상 적용
             return f"{color}{original}{self.RESET}"
         return original
 

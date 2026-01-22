@@ -21,7 +21,8 @@ from unittest.mock import Mock, patch, AsyncMock
 import asyncio
 
 import sys
-sys.path.insert(0, '/home/claude/ScalpingBot')
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scalping.ai.ai_engine import AIEngine
 

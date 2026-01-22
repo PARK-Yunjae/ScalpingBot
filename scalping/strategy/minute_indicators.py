@@ -612,7 +612,9 @@ def calculate_rsi_crossover(closes: List[float], period: int = 14, threshold: in
         avg_gain[i] = (avg_gain[i-1] * (period-1) + gains[i]) / period
         avg_loss[i] = (avg_loss[i-1] * (period-1) + losses[i]) / period
     
-    rs = np.where(avg_loss != 0, avg_gain / avg_loss, 100)
+    # avg_loss=0일 때 나눗셈 경고 방지
+    with np.errstate(divide='ignore', invalid='ignore'):
+        rs = np.where(avg_loss != 0, avg_gain / avg_loss, 100)
     rsi = 100 - (100 / (1 + rs))
     
     curr_rsi = rsi[-1]
@@ -698,8 +700,8 @@ def check_technical_filter(closes: List[float]) -> Dict[str, Any]:
         sell_conditions.append(True)
         reasons.append("RSI과매수")
     
-    # AND 조건: 두 조건 모두 충족
-    buy_signal = all(buy_conditions) and len(buy_conditions) >= 2
+    # OR 조건: 둘 중 하나라도 충족하면 통과 (점수는 AI가 판단)
+    buy_signal = any(buy_conditions)
     sell_signal = any(sell_conditions)
     
     return {

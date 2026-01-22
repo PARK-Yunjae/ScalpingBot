@@ -57,6 +57,7 @@ from scalping.strategy.scalp_signals import (
 from scalping.safety.kill_switch import KillSwitch
 from scalping.execution.cooldown_tracker import CooldownTracker
 from scalping.notification.discord_bot import DiscordNotifier
+from scalping.ai.ai_engine import AIEngine
 
 logger = logging.getLogger('ScalpingBot.ScalpEngine')
 
@@ -141,6 +142,7 @@ class ScalpEngine:
         self.premarket_analyzer: Optional[PreMarketAnalyzer] = None
         self.signal_generator: Optional[ScalpSignalGenerator] = None
         self.premarket_result: Optional[PreMarketResult] = None
+        self.ai_engine: Optional[AIEngine] = None
         
         # 종목 트래커 (유니버스)
         self._trackers: Dict[str, StockTracker] = {}
@@ -243,15 +245,33 @@ class ScalpEngine:
             logger.info("   ✅ 종목 매퍼 초기화 완료")
             
             # 6. 시그널 생성기
-            logger.info("\n[6/7] 시그널 생성기 초기화...")
+            logger.info("\n[6/8] 시그널 생성기 초기화...")
             self.signal_generator = ScalpSignalGenerator(self.config)
             logger.info("   ✅ 시그널 생성기 초기화 완료")
             
-            # 7. 프리마켓 분석기
-            logger.info("\n[7/7] 프리마켓 분석기 초기화...")
+            # 7. AI 엔진 (Gemini)
+            logger.info("\n[7/8] AI 엔진 초기화...")
+            ai_config = self.config.get('ai', {})
+            if ai_config.get('use_for_universe', False):
+                try:
+                    self.ai_engine = AIEngine(
+                        config=ai_config,
+                        secrets=self.secrets,
+                    )
+                    logger.info(f"   ✅ AI 엔진 초기화 완료 ({ai_config.get('provider', 'gemini')})")
+                except Exception as e:
+                    logger.warning(f"   ⚠️ AI 엔진 초기화 실패: {e}")
+                    self.ai_engine = None
+            else:
+                logger.info("   ⏭️ AI 유니버스 선정 비활성화 (use_for_universe: false)")
+            
+            # 8. 프리마켓 분석기
+            logger.info("\n[8/8] 프리마켓 분석기 초기화...")
             self.premarket_analyzer = PreMarketAnalyzer(
                 config=self.config,
                 broker=self.broker,
+                secrets=self.secrets,
+                ai_engine=self.ai_engine,
             )
             logger.info("   ✅ 프리마켓 분석기 초기화 완료")
             
@@ -261,6 +281,7 @@ class ScalpEngine:
                 webhook_url = self.secrets.get('discord', {}).get('webhook_url', '')
                 if webhook_url:
                     self.notifier = DiscordNotifier(webhook_url=webhook_url)
+                    self.notifier.start()  # ★ 스레드 시작 추가
                     logger.info("   ✅ Discord 알림 활성화")
             
             logger.info("\n" + "=" * 60)
@@ -350,7 +371,7 @@ class ScalpEngine:
                 else:
                     # 장 시작 전 대기
                     logger.info(f"장 시작 대기 중... ({now.strftime('%H:%M:%S')})")
-                    time.sleep(60)
+                    self._interruptible_sleep(60)
                 
         except Exception as e:
             logger.error(f"실행 에러: {e}")
@@ -364,9 +385,31 @@ class ScalpEngine:
         """시그널 핸들러 (Ctrl+C)"""
         logger.info(f"\n⚠️ 종료 신호 수신 (signal={signum})")
         self._running = False
+        # 즉시 종료 처리
+        self._shutdown()
+        import sys
+        sys.exit(0)
+    
+    def _interruptible_sleep(self, seconds: float, interval: float = 1.0):
+        """
+        인터럽트 가능한 sleep
+        
+        Args:
+            seconds: 총 대기 시간
+            interval: 체크 간격 (기본 1초)
+        """
+        elapsed = 0
+        while elapsed < seconds and self._running:
+            time.sleep(min(interval, seconds - elapsed))
+            elapsed += interval
     
     def _shutdown(self):
         """종료 처리 - 포지션 청산 + 상태 저장"""
+        # 중복 호출 방지
+        if hasattr(self, '_shutdown_called') and self._shutdown_called:
+            return
+        self._shutdown_called = True
+        
         logger.info("\n" + "=" * 60)
         logger.info("🛑 ScalpEngine 종료 처리 시작")
         logger.info("=" * 60)
@@ -410,6 +453,9 @@ class ScalpEngine:
                     f"거래: {self._stats.get('trades', 0)}건\n"
                     f"승률: {self._calculate_winrate():.1f}%"
                 )
+                import time
+                time.sleep(1)  # 메시지 전송 대기
+                self.notifier.stop()  # ★ 스레드 정리
             except:
                 pass
         
@@ -457,7 +503,7 @@ class ScalpEngine:
         """프리마켓 분석 실행"""
         if self.premarket_result:
             # 이미 분석 완료
-            time.sleep(60)
+            self._interruptible_sleep(60)
             return
         
         logger.info("📊 프리마켓 분석 시작...")
@@ -489,9 +535,16 @@ class ScalpEngine:
     
     def _analyze_gaps(self):
         """갭 분석 (08:50~09:05)"""
+        # 유니버스가 없으면 프리마켓 분석 강제 실행
+        if not self._trackers:
+            logger.warning("⚠️ 유니버스 미설정 - 프리마켓 분석 강제 실행")
+            self._run_premarket()
+            return
+        
+        logger.info("📊 갭 분석 중... (08:50~09:05)")
         # 시초가 형성 후 갭 분석
         # TODO: 시초가 조회 및 시나리오 업데이트
-        time.sleep(30)
+        self._interruptible_sleep(30)
     
     # =========================================================================
     # 스캘핑 메인 루프
@@ -499,9 +552,20 @@ class ScalpEngine:
     
     def _run_scalping_loop(self):
         """스캘핑 매매 루프"""
-        logger.debug("스캘핑 루프 시작")
-        
         loop_start = time.time()
+        
+        # 1분마다 상태 로그 출력
+        now = datetime.now()
+        if not hasattr(self, '_last_status_log') or (now - self._last_status_log).total_seconds() >= 60:
+            pos_count = self.position_manager.get_position_count()
+            logger.info(f"📈 스캘핑 모니터링 중... (유니버스: {len(self._trackers)}개, 포지션: {pos_count}/{self.max_positions})")
+            self._last_status_log = now
+        
+        # -1. 유니버스 체크 (없으면 프리마켓 분석 실행)
+        if not self._trackers:
+            logger.warning("⚠️ 유니버스 미설정 - 프리마켓 분석 실행")
+            self._run_premarket()
+            return
         
         # 0. 유니버스 갱신 체크 (10분마다)
         self._check_universe_refresh()
@@ -539,13 +603,12 @@ class ScalpEngine:
         if not universe_config.get('refresh_enabled', True):
             return
         
-        refresh_interval = universe_config.get('refresh_interval_minutes', 10)
+        refresh_interval = universe_config.get('refresh_interval', 10)
         now = datetime.now()
         
-        # 마지막 갱신 시간 체크
+        # 마지막 갱신 시간 체크 (첫 호출 시 즉시 실행)
         if not hasattr(self, '_last_universe_refresh'):
-            self._last_universe_refresh = now
-            return
+            self._last_universe_refresh = now - timedelta(minutes=refresh_interval + 1)  # 과거로 설정 → 즉시 실행
         
         minutes_since_refresh = (now - self._last_universe_refresh).total_seconds() / 60
         
@@ -568,6 +631,9 @@ class ScalpEngine:
             min_price = universe_config.get('min_price', 3000)
             max_price = universe_config.get('max_price', 50000)
             
+            # ETF 제외 패턴
+            etf_patterns = ['KODEX', 'TIGER', 'KOSEF', 'KBSTAR', 'HANARO', 'SOL', 'ACE', 'ARIRANG']
+            
             added_count = 0
             for stock in new_stocks[:20]:  # 상위 20개만
                 code = stock.get('code', '')
@@ -576,6 +642,10 @@ class ScalpEngine:
                 
                 # 가격 필터
                 if not (min_price <= price <= max_price):
+                    continue
+                
+                # ETF 필터 (스캘핑에 부적합)
+                if any(pattern in name for pattern in etf_patterns):
                     continue
                 
                 # 이미 있으면 스킵
@@ -630,19 +700,26 @@ class ScalpEngine:
         )
         
         best_signal: Optional[ScalpSignal] = None
+        scan_stats = {'total': 0, 'holding': 0, 'cooldown': 0, 'no_data': 0, 'tech_fail': 0, 'no_signal': 0, 'candidates': 0}
         
         for code, tracker in self._trackers.items():
+            scan_stats['total'] += 1
+            
             # 이미 보유 중이면 스킵
             if self.position_manager.has_position(code):
+                scan_stats['holding'] += 1
                 continue
             
             # 쿨타임 체크
             if not self.cooldown_tracker.can_buy(code):
+                scan_stats['cooldown'] += 1
                 continue
             
             # 분봉 데이터 업데이트 (기술적 필터용으로 30개)
             minute_data = self.broker.get_minute_ohlcv(code, interval=1, count=30)
-            if not minute_data or len(minute_data) < 20:
+            if not minute_data or len(minute_data) < 10:  # 20 → 10으로 완화 (장 초반 대응)
+                scan_stats['no_data'] += 1
+                logger.debug(f"   {tracker.name}: 분봉 데이터 부족 ({len(minute_data) if minute_data else 0}개)")
                 continue
             
             # 🆕 기술적 사전 필터 (MACD + RSI)
@@ -651,6 +728,7 @@ class ScalpEngine:
             
             if not tech_filter['buy_signal']:
                 # 기술적 조건 미충족 → 스킵 (API 호출 절감)
+                scan_stats['tech_fail'] += 1
                 continue
             
             # OHLCV 변환 (최신 봉)
@@ -687,9 +765,19 @@ class ScalpEngine:
             
             # BUY 시그널이면서 점수가 높으면 선택
             if signal.action == 'BUY':
+                scan_stats['candidates'] += 1
+                logger.info(f"   💡 매수 후보: {tracker.name}({code}) 점수:{signal.score:.0f} - {signal.reason}")
                 if best_signal is None or signal.score > best_signal.score:
                     best_signal = signal
                     best_signal.stock_code = code
+            else:
+                scan_stats['no_signal'] += 1
+        
+        # 스캔 통계 로그 (5분마다)
+        now = datetime.now()
+        if not hasattr(self, '_last_scan_log') or (now - self._last_scan_log).total_seconds() >= 300:
+            logger.info(f"🔍 스캔 통계: 총{scan_stats['total']} | 보유{scan_stats['holding']} | 쿨타임{scan_stats['cooldown']} | 데이터없음{scan_stats['no_data']} | 기술필터탈락{scan_stats['tech_fail']} | 시그널없음{scan_stats['no_signal']} | 후보{scan_stats['candidates']}")
+            self._last_scan_log = now
         
         # 최고 시그널로 매수
         if best_signal and best_signal.action == 'BUY':
@@ -697,6 +785,16 @@ class ScalpEngine:
     
     def _check_technical_filter(self, closes: list) -> dict:
         """기술적 사전 필터 (MACD + RSI)"""
+        # config에서 필터 활성화 여부 확인 (기본: 비활성화)
+        trading_config = self.config.get('trading', {})
+        if not trading_config.get('use_technical_filter', False):
+            # 필터 비활성화 → 항상 통과
+            return {
+                'buy_signal': True,
+                'score_bonus': 0,
+                'reasons': [],
+            }
+        
         try:
             from scalping.strategy.minute_indicators import check_technical_filter
             return check_technical_filter(closes)
@@ -769,7 +867,7 @@ class ScalpEngine:
                 quantity=quantity,
             )
             
-            if order_result.get('success'):
+            if order_result.success:
                 # 포지션 추가
                 self.position_manager.add_position(
                     stock_code=stock_code,
@@ -792,14 +890,14 @@ class ScalpEngine:
                     'signal_type': signal.signal_type.value,
                 })
                 
-                # 쿨타임 등록
-                self.cooldown_tracker.record_buy(stock_code)
+                # 쿨타임 등록 (매수 후 기본 쿨타임)
+                self.cooldown_tracker.set_cooldown(stock_code, is_loss=False, reason="매수 완료")
                 
                 # Discord 알림
                 if self.notifier:
-                    self.notifier.send_buy_notification(
-                        stock_name=tracker.name,
+                    self.notifier.send_buy_signal(
                         stock_code=stock_code,
+                        stock_name=tracker.name,
                         price=price,
                         quantity=quantity,
                         score=signal.score,
@@ -807,7 +905,7 @@ class ScalpEngine:
                 
                 logger.info(f"✅ 매수 완료: {tracker.name}")
             else:
-                logger.error(f"❌ 매수 실패: {order_result.get('message')}")
+                logger.error(f"❌ 매수 실패: {order_result.error}")
         else:
             logger.info(f"📝 [시뮬] 매수: {tracker.name} (LIVE_DATA_ONLY 모드)")
     
@@ -853,7 +951,7 @@ class ScalpEngine:
                 quantity=quantity,
             )
             
-            if order_result.get('success'):
+            if order_result.success:
                 # 포지션 제거
                 self.position_manager.remove_position(stock_code)
                 
@@ -894,11 +992,10 @@ class ScalpEngine:
                 
                 # Discord 알림
                 if self.notifier:
-                    self.notifier.send_sell_notification(
-                        stock_name=position.stock_name,
+                    self.notifier.send_sell_signal(
                         stock_code=stock_code,
-                        entry_price=position.entry_price,
-                        exit_price=current_price,
+                        stock_name=position.stock_name,
+                        price=current_price,
                         quantity=quantity,
                         profit_pct=profit_pct,
                         reason=reason.value,
@@ -906,7 +1003,7 @@ class ScalpEngine:
                 
                 logger.info(f"✅ 매도 완료: {position.stock_name}")
             else:
-                logger.error(f"❌ 매도 실패: {order_result.get('message')}")
+                logger.error(f"❌ 매도 실패: {order_result.error}")
         else:
             logger.info(f"📝 [시뮬] 매도: {position.stock_name} (LIVE_DATA_ONLY 모드)")
     
@@ -1145,13 +1242,24 @@ class ScalpEngine:
 # =============================================================================
 
 if __name__ == '__main__':
-    # 로깅 설정
+    from logging.handlers import TimedRotatingFileHandler
+    
+    # 로깅 설정 (일별 로테이션)
+    log_handler = TimedRotatingFileHandler(
+        'logs/scalp_engine.log',
+        when='midnight',
+        interval=1,
+        backupCount=7,  # 7일치 보관
+        encoding='utf-8',
+    )
+    log_handler.suffix = "%Y-%m-%d"
+    
     logging.basicConfig(
         level=logging.INFO,
         format='[%(asctime)s] %(levelname)s - %(message)s',
         handlers=[
             logging.StreamHandler(),
-            logging.FileHandler('logs/scalp_engine.log', encoding='utf-8'),
+            log_handler,
         ]
     )
     

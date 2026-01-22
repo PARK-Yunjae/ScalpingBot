@@ -952,6 +952,97 @@ JSON:"""
         else:
             self._stats['avg_response_time'] = (current_avg * (total - 1) + elapsed) / total
     
+    def generate(self, prompt: str, max_tokens: int = 1000, json_mode: bool = False) -> str:
+        """
+        프롬프트를 직접 호출하고 응답 텍스트를 반환 (동기 방식)
+        
+        프리마켓 분석 등 단발성 호출에 사용합니다.
+        
+        Args:
+            prompt: 프롬프트 문자열
+            max_tokens: 최대 토큰 수
+            json_mode: True면 JSON 형식으로만 응답 (Gemini만 지원)
+        
+        Returns:
+            AI 응답 텍스트
+        """
+        try:
+            if self.provider == 'gemini':
+                # Gemini 직접 호출 (max_tokens 적용)
+                url = f"{self.api_url}?key={self.api_key}"
+                
+                generation_config = {
+                    "temperature": 0.3,
+                    "maxOutputTokens": max_tokens,
+                    "topP": 0.9,
+                }
+                
+                # JSON 모드 활성화 시 응답 형식 강제
+                if json_mode:
+                    generation_config["responseMimeType"] = "application/json"
+                
+                payload = {
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": generation_config,
+                    "safetySettings": [
+                        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+                    ]
+                }
+                
+                response = requests.post(
+                    url,
+                    json=payload,
+                    timeout=self.timeout,
+                    headers={"Content-Type": "application/json"}
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    
+                    # 응답 완료 이유 확인
+                    candidate = data['candidates'][0]
+                    finish_reason = candidate.get('finishReason', 'UNKNOWN')
+                    
+                    if finish_reason == 'MAX_TOKENS':
+                        logger.warning(f"⚠️ Gemini 응답이 max_tokens({max_tokens})에서 잘림!")
+                    elif finish_reason == 'SAFETY':
+                        logger.warning("⚠️ Gemini 응답이 안전 필터에 의해 차단됨")
+                    elif finish_reason not in ('STOP', 'END_TURN'):
+                        logger.warning(f"⚠️ Gemini 응답 종료 이유: {finish_reason}")
+                    
+                    text = candidate['content']['parts'][0]['text']
+                    logger.debug(f"Gemini 응답 (finishReason={finish_reason}): {text[:200]}...")
+                    return text
+                else:
+                    error_detail = response.text[:500] if response.text else "No detail"
+                    raise Exception(f"Gemini API 에러: {response.status_code} - {error_detail}")
+            else:
+                # Ollama 호출
+                return self._call_ollama(prompt)
+                
+        except Exception as e:
+            logger.error(f"generate() 실패: {e}")
+            raise
+    
+    async def generate_async(self, prompt: str, max_tokens: int = 1000, json_mode: bool = False) -> str:
+        """
+        비동기 버전의 generate (async/await 지원)
+        
+        Args:
+            prompt: 프롬프트 문자열
+            max_tokens: 최대 토큰 수
+            json_mode: True면 JSON 형식으로만 응답
+        
+        Returns:
+            AI 응답 텍스트
+        """
+        import asyncio
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self.generate, prompt, max_tokens, json_mode)
+    
     def get_stats(self) -> Dict:
         """AI 엔진 통계 조회"""
         return {

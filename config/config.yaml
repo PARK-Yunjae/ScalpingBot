@@ -30,8 +30,8 @@ premarket:
 # -----------------------------------------
 ai:
   provider: gemini
-  model: gemini-2.5-flash-preview-05-20
-  timeout: 30
+  model: gemini-2.5-flash
+  timeout: 60
   max_queue_size: 10
   retry_count: 2
   use_for_entry: false
@@ -44,22 +44,25 @@ ai:
 # -----------------------------------------
 trading:
   # 손절/익절
-  stop_loss: -0.7
+  stop_loss: -1.2
   take_profit_1: 1.5
   take_profit_2: 2.5
+  
+  # 기술적 필터 (MACD OR RSI) - OR 조건으로 완화됨
+  use_technical_filter: true
   
   # 트레일링 스탑
   trailing:
     enabled: true
-    activation: 0.5
-    distance: 0.4
+    activation: 0.8
+    distance: 0.5
   
   # 시간 손절
   time_stop:
     enabled: true
-    no_profit_minutes: 5      # 5분으로 완화 (3분은 너무 짧음)
-    no_profit_threshold: 0.3
-    max_hold_minutes: 10
+    no_profit_minutes: 7      # 7분으로 완화
+    no_profit_threshold: 0.2  # 0.2% 이상이면 유지
+    max_hold_minutes: 15      # 최대 15분 보유
   
   # 시간 설정
   market_open: "09:05"
@@ -67,8 +70,8 @@ trading:
   force_close_time: "14:50"
   
   # 진입 점수
-  min_score: 55
-  min_score_conservative: 65
+  min_score: 65
+  min_score_conservative: 70
 
 # -----------------------------------------
 # 분봉 지표
@@ -81,7 +84,8 @@ indicators:
   
   breakout:
     cci_min: 100
-    rsi_max: 80
+    cci_max: 150       # ★ CCI 150 이상이면 이미 과열 → 진입 금지
+    rsi_max: 70        # RSI 70으로 하향 (80은 과매수)
     volume_min: 2.0
   
   pullback:
@@ -108,7 +112,7 @@ safety:
   
   consecutive_loss_rest: 3      # 3연패 → 10분 휴식
   rest_minutes: 10
-  consecutive_loss_stop: 5      # 5연패 → 당일 중단 + 프로그램 종료
+  consecutive_loss_stop: 7      # 7연패 → 당일 중단 + 프로그램 종료
   
   index_emergency_threshold: -2.5
   index_conservative_threshold: -1.5

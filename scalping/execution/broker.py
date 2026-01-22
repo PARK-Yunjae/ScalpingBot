@@ -1198,73 +1198,110 @@ class KISBroker:
     def get_minute_ohlcv(
         self,
         stock_code: str,
-        interval: int = 5,
+        interval: int = 1,
         count: int = 30,
     ) -> List[Dict]:
         """
-        분봉 데이터 조회 (한투 API FHKST03010100)
+        분봉 데이터 조회 (한투 API FHKST03010200)
+        
+        주의: 한투 API는 당일 1분봉만 제공, 한 번에 30개씩만 조회 가능
+        30분씩 시간을 거슬러 반복 호출하여 데이터 수집
         
         Args:
             stock_code: 종목 코드
-            interval: 봉 간격 (1, 3, 5, 10, 15, 30, 60분)
+            interval: 봉 간격 (1분봉만 지원, 다른 값은 1분봉을 resample)
             count: 조회할 봉 개수
         
         Returns:
             분봉 데이터 리스트 (최신순 정렬)
-            [
-                {'timestamp': 'HHmm', 'open': ..., 'high': ..., 'low': ..., 
-                 'close': ..., 'volume': ...},
-                ...
-            ]
         """
         try:
-            # 현재 시간 (HHMMSS)
-            from datetime import datetime
+            from datetime import datetime, timedelta
+            
+            all_data = []
             now = datetime.now()
-            time_str = now.strftime("%H%M%S")
+            time_end = now.strftime("%H%M%S")
             
-            params = {
-                "FID_ETC_CLS_CODE": "",
-                "FID_COND_MRKT_DIV_CODE": "J",  # 주식
-                "FID_INPUT_ISCD": stock_code,
-                "FID_INPUT_HOUR_1": time_str,  # 조회 기준 시간
-                "FID_PW_DATA_INCU_YN": "N",    # 과거 데이터 포함 여부
-            }
+            # 필요한 만큼 반복 호출 (30개씩)
+            max_iterations = (count // 30) + 2  # 여유있게
             
-            # tr_id: FHKST03010100 (국내주식분봉조회)
-            response = self._request(
-                method='GET',
-                endpoint='/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice',
-                tr_id='FHKST03010100',
-                params=params
-            )
-            
-            ohlcv_list = []
-            output2 = response.get('output2', [])
-            
-            for item in output2[:count]:
-                # 시간 형식: HHMMSS
-                raw_time = item.get('stck_cntg_hour', '')
-                if len(raw_time) >= 4:
-                    formatted_time = f"{raw_time[:2]}:{raw_time[2:4]}"
-                else:
-                    formatted_time = raw_time
+            for i in range(max_iterations):
+                if len(all_data) >= count:
+                    break
                 
-                ohlcv_list.append({
-                    'timestamp': formatted_time,
-                    'open': float(item.get('stck_oprc', 0)),
-                    'high': float(item.get('stck_hgpr', 0)),
-                    'low': float(item.get('stck_lwpr', 0)),
-                    'close': float(item.get('stck_prpr', 0)),  # 현재가 = 종가
-                    'volume': int(item.get('cntg_vol', 0)),   # 체결량
-                    'cumulative_volume': int(item.get('acml_vol', 0)),  # 누적 거래량
-                })
+                params = {
+                    "FID_ETC_CLS_CODE": "",
+                    "FID_COND_MRKT_DIV_CODE": "J",  # 주식 (KRX)
+                    "FID_INPUT_ISCD": stock_code,
+                    "FID_INPUT_HOUR_1": time_end,   # 조회 기준 시간
+                    "FID_PW_DATA_INCU_YN": "Y",     # ★ 과거 데이터 포함 (N→Y 수정!)
+                }
+                
+                # tr_id: FHKST03010200 (당일 분봉 조회)
+                response = self._request(
+                    method='GET',
+                    endpoint='/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice',
+                    tr_id='FHKST03010200',
+                    params=params
+                )
+                
+                # ★ 디버그: API 응답 확인
+                if i == 0:  # 첫 번째 호출만 로깅
+                    rt_cd = response.get('rt_cd', '')
+                    msg1 = response.get('msg1', '')
+                    output2_len = len(response.get('output2', []))
+                    if output2_len == 0:
+                        logger.warning(f"분봉 API 응답 ({stock_code}): rt_cd={rt_cd}, msg={msg1}, output2={output2_len}개")
+                
+                output2 = response.get('output2', [])
+                
+                if not output2:
+                    # 더 이상 데이터 없음 (장 시작 전 도달)
+                    break
+                
+                for item in output2:
+                    raw_time = item.get('stck_cntg_hour', '')
+                    if len(raw_time) >= 4:
+                        formatted_time = f"{raw_time[:2]}:{raw_time[2:4]}"
+                    else:
+                        formatted_time = raw_time
+                    
+                    all_data.append({
+                        'timestamp': formatted_time,
+                        'open': float(item.get('stck_oprc', 0)),
+                        'high': float(item.get('stck_hgpr', 0)),
+                        'low': float(item.get('stck_lwpr', 0)),
+                        'close': float(item.get('stck_prpr', 0)),
+                        'volume': int(item.get('cntg_vol', 0)),
+                        'cumulative_volume': int(item.get('acml_vol', 0)),
+                    })
+                
+                # 30분 전으로 이동하여 다음 조회
+                time_dt = datetime.strptime(time_end, "%H%M%S")
+                time_dt -= timedelta(minutes=30)
+                time_end = time_dt.strftime("%H%M%S")
+                
+                # 09:00 이전이면 중단
+                if time_dt.hour < 9:
+                    break
             
-            logger.debug(f"분봉 조회 성공 ({stock_code}): {len(ohlcv_list)}개")
-            return ohlcv_list
+            # 중복 제거 (timestamp 기준)
+            seen = set()
+            unique_data = []
+            for item in all_data:
+                if item['timestamp'] not in seen:
+                    seen.add(item['timestamp'])
+                    unique_data.append(item)
+            
+            # 최신순 정렬 (시간 내림차순)
+            unique_data.sort(key=lambda x: x['timestamp'], reverse=True)
+            
+            result = unique_data[:count]
+            logger.debug(f"분봉 조회 성공 ({stock_code}): {len(result)}개")
+            return result
         
         except Exception as e:
-            logger.error(f"분봉 조회 에러 ({stock_code}): {e}")
+            logger.warning(f"분봉 조회 에러 ({stock_code}): {e}")
             return []
     
     def get_minute_ohlcv_n(

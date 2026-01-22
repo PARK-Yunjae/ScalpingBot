@@ -483,6 +483,21 @@ class DiscordNotifier:
         )
         self._queue_message(payload)
     
+    def send_message(self, title: str, message: str = ""):
+        """
+        일반 메시지 전송
+        
+        Args:
+            title: 메시지 제목
+            message: 메시지 내용 (선택)
+        """
+        payload = self._build_embed(
+            title=title,
+            description=message,
+            color=AlertLevel.INFO.value,
+        )
+        self._queue_message(payload)
+    
     def send_warning(self, message: str):
         """경고 메시지"""
         payload = self._build_embed(

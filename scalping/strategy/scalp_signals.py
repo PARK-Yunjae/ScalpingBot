@@ -362,16 +362,22 @@ class ScalpSignalGenerator:
             score += 8
             breakdown['거래량보통'] = 8
         
-        # 4. CCI 모멘텀
+        # 4. CCI 모멘텀 (150 이상은 과열 → 스킵)
         if indicators.cci >= 150:
-            score += 15
-            breakdown['CCI강함'] = 15
+            # CCI 과열 시 돌파 매수 부적합
+            return {
+                'type': SignalType.BREAKOUT,
+                'score': 0,
+                'breakdown': {'CCI과열': 0},
+                'reason': f"CCI 과열 ({indicators.cci:.0f}) - 돌파 스킵",
+                'warnings': ["CCI 150 이상 과열 상태"],
+            }
         elif indicators.cci >= SignalParams.BREAKOUT_CCI_MIN:
-            score += 10
-            breakdown['CCI적정'] = 10
+            score += 15
+            breakdown['CCI적정'] = 15
         elif indicators.cci >= 50:
-            score += 5
-            breakdown['CCI약함'] = 5
+            score += 8
+            breakdown['CCI약함'] = 8
         
         # 5. RSI 적정 (과열 아님)
         if 50 <= indicators.rsi <= 70:
