@@ -38,7 +38,7 @@ ScalpingBot v2.4 - Kill Switch (비상 정지)
 import logging
 import threading
 from typing import Dict, List, Optional, Callable, Any
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -142,6 +142,9 @@ class KillSwitch:
         max_api_errors: int = DEFAULT_MAX_API_ERRORS,
         emergency_kospi_change: float = DEFAULT_EMERGENCY_KOSPI_CHANGE,
         on_emergency: Callable[[StopReason, str], None] = None,
+        # 3연패 휴식 설정
+        rest_after_losses: int = 3,
+        rest_minutes: int = 10,
     ):
         """
         초기화
@@ -155,6 +158,8 @@ class KillSwitch:
             max_api_errors: API 에러 한도
             emergency_kospi_change: 코스피 급락 임계값 (%)
             on_emergency: 비상 상황 콜백
+            rest_after_losses: N연패 후 휴식 (기본 3)
+            rest_minutes: 휴식 시간 (기본 10분)
         """
         self.broker = broker
         self.notifier = notifier
@@ -165,6 +170,11 @@ class KillSwitch:
         self.max_daily_loss_pct = max_daily_loss_pct
         self.max_api_errors = max_api_errors
         self.emergency_kospi_change = emergency_kospi_change
+        
+        # 3연패 휴식 설정
+        self.rest_after_losses = rest_after_losses
+        self.rest_minutes = rest_minutes
+        self._rest_until: Optional[datetime] = None
         
         # 콜백
         self.on_emergency = on_emergency
@@ -185,7 +195,8 @@ class KillSwitch:
         logger.info(
             f"KillSwitch 초기화 "
             f"(연속손절 한도: {max_consecutive_losses}회, "
-            f"일일손실 한도: {max_daily_loss_pct}%)"
+            f"일일손실 한도: {max_daily_loss_pct}%, "
+            f"{rest_after_losses}연패 시 {rest_minutes}분 휴식)"
         )
     
     # =========================================================================
@@ -211,6 +222,39 @@ class KillSwitch:
         """
         with self._lock:
             return self._status.state != SystemState.RUNNING
+    
+    def is_resting(self) -> bool:
+        """
+        휴식 중 여부 확인 (3연패 후 10분 휴식)
+        
+        Returns:
+            True: 휴식 중 (매수 금지)
+        """
+        with self._lock:
+            if self._rest_until is None:
+                return False
+            
+            if datetime.now() >= self._rest_until:
+                # 휴식 종료
+                logger.info("☕ 휴식 종료 - 매매 재개")
+                self._rest_until = None
+                self._status.consecutive_losses = 0  # 연속 손절 리셋
+                return False
+            
+            return True
+    
+    def get_rest_remaining(self) -> int:
+        """
+        남은 휴식 시간 (초)
+        
+        Returns:
+            남은 초, 휴식 중 아니면 0
+        """
+        with self._lock:
+            if self._rest_until is None:
+                return 0
+            remaining = (self._rest_until - datetime.now()).total_seconds()
+            return max(0, int(remaining))
     
     def get_status(self) -> SafetyStatus:
         """상태 조회"""
@@ -337,12 +381,32 @@ class KillSwitch:
                     self._stock_losses[stock_code] = \
                         self._stock_losses.get(stock_code, 0) + 1
                 
-                # 연속 손절 체크
+                # 1️⃣ 최대 연속 손절 → 프로그램 종료
                 if self._status.consecutive_losses >= self.max_consecutive_losses:
                     logger.warning(
                         f"연속 손절 {self._status.consecutive_losses}회 도달!"
                     )
                     self._trigger_consecutive_loss()
+                    return
+                
+                # 2️⃣ N연패 휴식 (rest_after_losses의 배수일 때)
+                if (self.rest_after_losses > 0 and 
+                    self._status.consecutive_losses > 0 and
+                    self._status.consecutive_losses % self.rest_after_losses == 0):
+                    
+                    self._rest_until = datetime.now() + timedelta(minutes=self.rest_minutes)
+                    logger.warning(
+                        f"☕ {self._status.consecutive_losses}연패 → "
+                        f"{self.rest_minutes}분 휴식 (~{self._rest_until.strftime('%H:%M:%S')})"
+                    )
+                    
+                    # Discord 알림
+                    if self.notifier:
+                        self.notifier.send_message(
+                            f"☕ {self._status.consecutive_losses}연패 휴식",
+                            f"{self.rest_minutes}분 후 재개 "
+                            f"({self._rest_until.strftime('%H:%M:%S')})"
+                        )
     
     def record_loss(self, stock_code: str):
         """손절 기록"""

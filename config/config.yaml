@@ -11,17 +11,17 @@
 mode: LIVE_MICRO  # LIVE_DATA_ONLY / LIVE_MICRO / LIVE
 
 # -----------------------------------------
-# 프리마켓 분석
+# 프리마켓 분석 (08:50 시작 → 동시호가 거래량 반영)
 # -----------------------------------------
 premarket:
   enabled: true
-  start_time: "08:00"
+  start_time: "08:50"
   schedule:
-    volume_top: "08:10"
-    news_collect: "08:15"
-    sector_analysis: "08:20"
-    ai_analysis: "08:30"
-    gap_analysis: "08:50"
+    volume_top: "08:50"
+    news_collect: "08:52"
+    sector_analysis: "08:54"
+    ai_analysis: "08:55"
+    gap_analysis: "09:00"
   volume_top_count: 50
   news_per_stock: 5
 
@@ -38,40 +38,46 @@ ai:
   use_for_universe: true
   use_for_news: true
   use_for_review: true
+  use_for_quick_filter: true   # 장중 AI 필터 (테스트 중)
 
 # -----------------------------------------
 # 매매 전략
 # -----------------------------------------
 trading:
-  # 손절/익절
-  stop_loss: -1.2
-  take_profit_1: 1.5
-  take_profit_2: 2.5
+  # 손절/익절 (슬리피지 0.3% + 비용 0.2% 감안)
+  stop_loss: -0.8              # -1.2 → -0.8 (실제 -1.1%)
+  take_profit_1: 2.5           # 2.0 → 2.5 (분위기 좋을 때)
+  take_profit_2: 3.5           # 3.0 → 3.5
   
   # 기술적 필터 (MACD OR RSI) - OR 조건으로 완화됨
   use_technical_filter: true
   
-  # 트레일링 스탑
+  # 트레일링 스탑 (net 기준으로 발동)
   trailing:
     enabled: true
-    activation: 0.8
-    distance: 0.5
+    activation: 1.2            # 0.8 → 1.2 (net +0.7% 이상)
+    distance: 0.8              # 0.5 → 0.8 (여유있게)
   
-  # 시간 손절
+  # 시간 손절 (0% 청산 방지)
   time_stop:
     enabled: true
-    no_profit_minutes: 7      # 7분으로 완화
-    no_profit_threshold: 0.2  # 0.2% 이상이면 유지
-    max_hold_minutes: 15      # 최대 15분 보유
+    no_profit_minutes: 12      # 7 → 12분
+    no_profit_threshold: 0.7   # 0.2 → 0.7% (비용 커버)
+    max_hold_minutes: 20       # 15 → 20분
   
   # 시간 설정
   market_open: "09:05"
-  market_close: "14:50"
-  force_close_time: "14:50"
+  market_close: "15:07"        # 15:15 → 15:07 (시간손절 12분 + 여유)
+  force_close_time: "15:07"    # 14:50 → 15:07
+
+  # 점심시간 매수 금지
+  lunch_break_enabled: true
+  lunch_break_start: "12:00"
+  lunch_break_end: "13:00"     # 13:00 → 13:30으로 변경 가능
   
-  # 진입 점수
-  min_score: 65
-  min_score_conservative: 70
+  # 진입 점수 (거래 빈도↓, 기대값↑)
+  min_score: 70                # 65 → 70
+  min_score_conservative: 75   # 70 → 75
 
 # -----------------------------------------
 # 분봉 지표
@@ -81,6 +87,13 @@ indicators:
   cci_period: 14
   rsi_period: 14
   volume_avg_period: 10
+  
+  # 전략 활성화 (vwap_bounce는 슬리피지에 취약)
+  strategies:
+    breakout: true
+    pullback: true
+    gap_play: true
+    vwap_bounce: false         # 비활성화 (떨어지는 칼날 금지)
   
   breakout:
     cci_min: 100
@@ -103,14 +116,14 @@ indicators:
 # -----------------------------------------
 safety:
   max_positions: 3
-  max_position_size: 150000     # 종목당 15만원
-  max_total_exposure: 400000    # 총 40만원
+  max_position_size: 130000     # 종목당 13만원
+  max_total_exposure: 450000    # 총 45 만원
   
   max_daily_loss: -15000        # 일일 -1.5만원
   max_daily_loss_pct: -3.0
   max_daily_trades: 20
   
-  consecutive_loss_rest: 3      # 3연패 → 10분 휴식
+  consecutive_loss_rest: 3      # 3연패 → 10분 휴식 ✅ 이제 작동함!
   rest_minutes: 10
   consecutive_loss_stop: 7      # 7연패 → 당일 중단 + 프로그램 종료
   
@@ -118,17 +131,17 @@ safety:
   index_conservative_threshold: -1.5
 
 # -----------------------------------------
-# 유니버스
+# 유니버스 (시총: 250억 ~ 10조)
 # -----------------------------------------
 universe:
   condition_name: "TV100"
   target_size: 50
   min_price: 3000
-  max_price: 50000       # 5만원 이하 (스캘핑 적합)
+  max_price: 50000              # 5만원 이하 (스캘핑 적합)
   min_volume: 500000
-  min_market_cap: 50000000000
-  max_market_cap: 3000000000000
-  refresh_interval: 10   # 장중 갱신 주기 (분)
+  min_market_cap: 25000000000   # 250억 (0.25조)
+  max_market_cap: 10000000000000 # 10조
+  refresh_interval: 10          # 장중 갱신 주기 (분)
   
   prev_day:
     min_change_pct: 0.5

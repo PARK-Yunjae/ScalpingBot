@@ -191,9 +191,26 @@ class ScalpSignalGenerator:
         self.min_score = trading_config.get('min_score', SignalParams.MIN_SCORE)
         self.min_score_conservative = self.min_score + 10
         
+        # 전략 활성화 설정
+        indicators_config = self.config.get('indicators', {})
+        strategies_config = indicators_config.get('strategies', {})
+        self.enable_breakout = strategies_config.get('breakout', True)
+        self.enable_pullback = strategies_config.get('pullback', True)
+        self.enable_gap_play = strategies_config.get('gap_play', True)
+        self.enable_vwap_bounce = strategies_config.get('vwap_bounce', True)
+        
+        # 비활성화된 전략 로그
+        disabled = []
+        if not self.enable_breakout: disabled.append('breakout')
+        if not self.enable_pullback: disabled.append('pullback')
+        if not self.enable_gap_play: disabled.append('gap_play')
+        if not self.enable_vwap_bounce: disabled.append('vwap_bounce')
+        
         logger.info(f"ScalpSignalGenerator 초기화 "
                    f"(손절:{self.stop_loss}%, 익절1:{self.take_profit_1}%, "
                    f"최소점수:{self.min_score})")
+        if disabled:
+            logger.info(f"   ⚠️ 비활성화 전략: {', '.join(disabled)}")
     
     def evaluate(
         self,
@@ -233,13 +250,16 @@ class ScalpSignalGenerator:
         if not self._pass_basic_filters(indicators, context, signal):
             return signal
         
-        # 각 전략 평가
-        strategies = [
-            self._evaluate_breakout,
-            self._evaluate_pullback,
-            self._evaluate_gap_play,
-            self._evaluate_vwap_bounce,
-        ]
+        # 각 전략 평가 (활성화된 전략만)
+        strategies = []
+        if self.enable_breakout:
+            strategies.append(self._evaluate_breakout)
+        if self.enable_pullback:
+            strategies.append(self._evaluate_pullback)
+        if self.enable_gap_play:
+            strategies.append(self._evaluate_gap_play)
+        if self.enable_vwap_bounce:
+            strategies.append(self._evaluate_vwap_bounce)
         
         best_signal = signal
         best_score = 0

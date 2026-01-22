@@ -72,10 +72,16 @@ PROFIT_TARGETS = {
 # 손절 설정 (스캘핑용)
 DEFAULT_STOP_LOSS = -0.7  # -0.7% (순손 -1.24%)
 
-# 시간 손절 설정
-DEFAULT_TIME_STOP_MINUTES = 3     # N분 내 수익 없으면 청산
-DEFAULT_TIME_STOP_THRESHOLD = 0.3  # 최소 기대 수익률 (%)
-DEFAULT_MAX_HOLD_MINUTES = 10      # 최대 보유 시간 (분)
+# 거래 비용 (net 수익률 계산용)
+TRADING_COST = 0.5  # 슬리피지 0.3% + 수수료 0.03% + 세금 0.18% ≈ 0.5%
+
+# 시간 손절 설정 (config에서 덮어쓸 수 있음)
+DEFAULT_TIME_STOP_MINUTES = 12     # N분 내 수익 없으면 청산 (7→12)
+DEFAULT_TIME_STOP_THRESHOLD = 0.7  # 최소 기대 수익률 (%) - 비용 커버 (0.3→0.7)
+DEFAULT_MAX_HOLD_MINUTES = 20      # 최대 보유 시간 (분) (10→20)
+
+# 트레일링 활성화 기준 (net 기준)
+TRAILING_ACTIVATION_GROSS = 1.2    # gross 1.2% 이상 (net 0.7%)
 
 
 class SellReason(Enum):
@@ -530,45 +536,50 @@ class PositionManager:
                 message=f"익절 도달 ({profit_pct:.2f}% ≥ {position.target_profit}%)"
             )
         
-        # 3. 트레일링 스탑 체크 (수익 구간에서만)
-        if position.high_profit_pct >= 0.5:  # 0.5% 이상 수익 경험 시 활성화
+        # 3. 트레일링 스탑 체크 (net 수익 구간에서만)
+        # gross 1.2% 이상 = net 0.7% 이상일 때만 트레일링 활성화
+        if position.high_profit_pct >= TRAILING_ACTIVATION_GROSS:
             drop_from_high = position.high_profit_pct - profit_pct
             
             if drop_from_high >= position.trailing_stop:
-                return SellSignal(
-                    stock_code=position.stock_code,
-                    action='SELL',
-                    reason=SellReason.TRAILING_STOP,
-                    current_price=position.current_price,
-                    profit_pct=profit_pct,
-                    message=f"트레일링 스탑 (고점 {position.high_profit_pct:.2f}% → 현재 {profit_pct:.2f}%)"
-                )
+                # net 수익이 플러스일 때만 트레일링 청산
+                net_profit = profit_pct - TRADING_COST
+                if net_profit >= 0:  # 최소 본전 이상
+                    return SellSignal(
+                        stock_code=position.stock_code,
+                        action='SELL',
+                        reason=SellReason.TRAILING_STOP,
+                        current_price=position.current_price,
+                        profit_pct=profit_pct,
+                        message=f"트레일링 스탑 (고점 {position.high_profit_pct:.2f}% → 현재 {profit_pct:.2f}%, net {net_profit:.2f}%)"
+                    )
         
         # 4. 시간 손절 체크 (스캘핑 핵심!)
         hold_minutes = (datetime.now() - position.entry_time).total_seconds() / 60
+        net_profit = profit_pct - TRADING_COST  # net 수익률
         
-        # 4-1. 3분 내 +0.3% 미달 시 청산
+        # 4-1. N분 내 net 수익 미달 시 청산
         if hold_minutes >= DEFAULT_TIME_STOP_MINUTES:
-            if profit_pct < DEFAULT_TIME_STOP_THRESHOLD:
+            if net_profit < 0:  # net 기준 손실이면 청산
                 return SellSignal(
                     stock_code=position.stock_code,
                     action='SELL',
                     reason=SellReason.TIME_STOP,
                     current_price=position.current_price,
                     profit_pct=profit_pct,
-                    message=f"시간손절 ({hold_minutes:.1f}분 경과, 수익 {profit_pct:.2f}% < {DEFAULT_TIME_STOP_THRESHOLD}%)"
+                    message=f"시간손절 ({hold_minutes:.1f}분 경과, gross {profit_pct:.2f}%, net {net_profit:.2f}%)"
                 )
         
-        # 4-2. 10분 경과 + 손익 근처 시 청산
+        # 4-2. 최대보유시간 경과 + net 손익분기 근처 시 청산
         if hold_minutes >= DEFAULT_MAX_HOLD_MINUTES:
-            if -0.3 <= profit_pct <= 0.5:  # 손익분기 근처
+            if -0.5 <= net_profit <= 0.3:  # net 기준 손익분기 근처
                 return SellSignal(
                     stock_code=position.stock_code,
                     action='SELL',
                     reason=SellReason.TIME_STOP,
                     current_price=position.current_price,
                     profit_pct=profit_pct,
-                    message=f"최대보유시간 ({hold_minutes:.1f}분 > {DEFAULT_MAX_HOLD_MINUTES}분, 수익 {profit_pct:.2f}%)"
+                    message=f"최대보유시간 ({hold_minutes:.1f}분 > {DEFAULT_MAX_HOLD_MINUTES}분, net {net_profit:.2f}%)"
                 )
         
         # 홀드
@@ -577,7 +588,7 @@ class PositionManager:
             action='HOLD',
             current_price=position.current_price,
             profit_pct=profit_pct,
-            message=f"보유 중 ({profit_pct:+.2f}%, {hold_minutes:.1f}분)"
+            message=f"보유 중 (gross {profit_pct:+.2f}%, net {net_profit:+.2f}%, {hold_minutes:.1f}분)"
         )
     
     def update_all_prices(

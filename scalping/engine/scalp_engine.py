@@ -147,6 +147,11 @@ class ScalpEngine:
         # 종목 트래커 (유니버스)
         self._trackers: Dict[str, StockTracker] = {}
         
+        # 회피 종목 캐시 (당일 한정, 프리마켓 AI가 지정한 종목)
+        self._avoid_codes: set = set()
+        self._avoid_names: set = set()  # 종목명으로도 체크
+        self._avoid_date: Optional[str] = None  # 회피 목록 생성 날짜
+        
         # 설정값 로드
         trading_config = self.config.get('trading', {})
         safety_config = self.config.get('safety', {})
@@ -234,7 +239,9 @@ class ScalpEngine:
             safety_config = self.config.get('safety', {})
             self.kill_switch = KillSwitch(
                 max_daily_loss_pct=safety_config.get('max_daily_loss_pct', -3.0),
-                max_consecutive_losses=safety_config.get('consecutive_loss_stop', 5),
+                max_consecutive_losses=safety_config.get('consecutive_loss_stop', 7),
+                rest_after_losses=safety_config.get('consecutive_loss_rest', 3),
+                rest_minutes=safety_config.get('rest_minutes', 10),
             )
             self.cooldown_tracker = CooldownTracker()
             logger.info("   ✅ 안전장치 초기화 완료")
@@ -328,15 +335,121 @@ class ScalpEngine:
         except Exception as e:
             logger.debug(f"이전 상태 확인 실패: {e}")
     
+    def _acquire_pid_lock(self) -> bool:
+        """
+        PID 락 획득 (중복 실행 방지)
+        
+        Returns:
+            True: 락 획득 성공
+            False: 이미 실행 중인 프로세스 존재
+        """
+        pid_file = Path('logs') / 'scalping.pid'
+        pid_file.parent.mkdir(parents=True, exist_ok=True)
+        
+        if pid_file.exists():
+            try:
+                with open(pid_file, 'r') as f:
+                    old_pid = int(f.read().strip())
+                
+                # 프로세스 존재 확인
+                try:
+                    os.kill(old_pid, 0)  # 시그널 0 = 존재 확인만
+                    # 프로세스 존재함 → 중복 실행
+                    logger.error(f"⚠️ 이미 실행 중인 프로세스 존재: PID {old_pid}")
+                    return False
+                except OSError:
+                    # 프로세스 없음 → 오래된 PID 파일, 계속 진행
+                    logger.info(f"🔄 이전 PID {old_pid} 종료됨 - 락 재획득")
+            except (ValueError, FileNotFoundError):
+                pass
+        
+        # 새 PID 기록
+        with open(pid_file, 'w') as f:
+            f.write(str(os.getpid()))
+        
+        logger.info(f"🔒 PID 락 획득: {os.getpid()}")
+        return True
+    
+    def _release_pid_lock(self):
+        """PID 락 해제"""
+        pid_file = Path('logs') / 'scalping.pid'
+        try:
+            if pid_file.exists():
+                pid_file.unlink()
+                logger.debug("PID 락 해제")
+        except Exception as e:
+            logger.debug(f"PID 락 해제 실패: {e}")
+    
+    def _sync_positions_with_broker(self):
+        """
+        브로커와 포지션 동기화 (재시작 시 불일치 해결)
+        
+        DB에는 있지만 실제 보유하지 않은 포지션 삭제
+        """
+        if not self.broker or not self.position_manager:
+            return
+        
+        positions = self.position_manager.get_all_positions()
+        if not positions:
+            return
+        
+        logger.info(f"\n🔄 포지션 동기화 시작: {len(positions)}개")
+        
+        # 실제 보유 종목 조회
+        try:
+            broker_positions = self.broker.get_positions()
+            holding_codes = {p.stock_code for p in broker_positions} if broker_positions else set()
+            logger.info(f"   브로커 보유: {len(holding_codes)}개 종목")
+        except Exception as e:
+            logger.warning(f"보유 종목 조회 실패: {e}")
+            return
+        
+        removed = 0
+        updated = 0
+        
+        for pos in positions:
+            code = pos.stock_code
+            
+            # 실제로 보유하지 않음 → 삭제
+            if code not in holding_codes:
+                logger.warning(f"   ⚠️ 보유 불일치: {pos.stock_name}({code}) - DB 삭제")
+                self.position_manager.remove_position(code)
+                removed += 1
+                continue
+            
+            # 현재가 갱신
+            try:
+                current_price = self.broker.get_current_price(code)
+                if current_price > 0:
+                    pos.current_price = current_price
+                    pos.high_price = max(pos.high_price or 0, current_price)
+                    pos.profit_pct = (current_price - pos.entry_price) / pos.entry_price * 100
+                    updated += 1
+                    logger.info(f"   ✅ 가격 갱신: {pos.stock_name} {pos.entry_price:,}→{current_price:,}원 ({pos.profit_pct:+.2f}%)")
+            except Exception as e:
+                logger.debug(f"   가격 조회 실패 ({code}): {e}")
+        
+        if removed > 0 or updated > 0:
+            logger.info(f"🔄 동기화 완료: 삭제 {removed}개, 갱신 {updated}개")
+    
     # =========================================================================
     # 메인 루프
     # =========================================================================
     
     def run(self):
         """메인 실행"""
+        # PID 락 획득 (중복 실행 방지)
+        if not self._acquire_pid_lock():
+            logger.error("❌ 이미 실행 중인 프로세스 존재 - 종료")
+            return
+        
         if not self.initialize():
             logger.error("초기화 실패 - 종료")
+            self._release_pid_lock()
             return
+        
+        # 브로커와 포지션 동기화 (재시작 시 불일치 해결)
+        self._sync_positions_with_broker()
         
         # 시그널 핸들러
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -434,8 +547,13 @@ class ScalpEngine:
                         result = self.broker.sell_market(pos.stock_code, pos.quantity)
                         if result.success:
                             logger.info(f"  ✅ {pos.stock_code} {pos.quantity}주 청산 완료")
+                            self.position_manager.remove_position(pos.stock_code)
                         else:
                             logger.error(f"  ❌ {pos.stock_code} 청산 실패: {result.error}")
+                            # 수량 초과 = 실제로 없음 → 포지션 삭제
+                            if "수량" in str(result.error) and "초과" in str(result.error):
+                                logger.warning(f"  ⚠️ 보유 불일치 - {pos.stock_code} 포지션 강제 삭제")
+                                self.position_manager.remove_position(pos.stock_code)
                     except Exception as e:
                         logger.error(f"  ❌ {pos.stock_code} 청산 에러: {e}")
             else:
@@ -458,6 +576,9 @@ class ScalpEngine:
                 self.notifier.stop()  # ★ 스레드 정리
             except:
                 pass
+        
+        # 5. PID 락 해제
+        self._release_pid_lock()
         
         logger.info("=" * 60)
         logger.info("ScalpEngine 종료 완료")
@@ -528,6 +649,32 @@ class ScalpEngine:
                 )
             
             logger.info(f"✅ {len(self._trackers)}개 종목 유니버스 설정")
+        
+        # 회피 목록 저장 (당일 한정)
+        if self.premarket_result and self.premarket_result.avoid_stocks:
+            self._avoid_codes.clear()
+            self._avoid_names = set()  # 종목명도 저장
+            self._avoid_date = datetime.now().strftime('%Y-%m-%d')
+            for item in self.premarket_result.avoid_stocks:
+                # item 형태: (종목명, 이유) 튜플 또는 dict
+                if isinstance(item, tuple) and len(item) >= 1:
+                    name = item[0]
+                    self._avoid_names.add(name)
+                    # 종목명으로 code 찾기
+                    code = self.stock_mapper.name_to_code(name) if self.stock_mapper else None
+                    if code:
+                        self._avoid_codes.add(code)
+                elif isinstance(item, dict):
+                    if 'code' in item:
+                        self._avoid_codes.add(item['code'])
+                    if 'name' in item:
+                        self._avoid_names.add(item['name'])
+                elif hasattr(item, 'code'):
+                    self._avoid_codes.add(item.code)
+                    if hasattr(item, 'name'):
+                        self._avoid_names.add(item.name)
+            if self._avoid_codes or self._avoid_names:
+                logger.info(f"🚫 회피 목록 캐시: {len(self._avoid_codes)}개 코드, {len(self._avoid_names)}개 종목명")
         
         # Discord 알림
         if self.notifier and self.premarket_result:
@@ -635,6 +782,16 @@ class ScalpEngine:
             etf_patterns = ['KODEX', 'TIGER', 'KOSEF', 'KBSTAR', 'HANARO', 'SOL', 'ACE', 'ARIRANG']
             
             added_count = 0
+            skipped_avoid = 0
+            skipped_ai = 0
+            
+            # 회피 목록 날짜 체크 (당일 한정)
+            today = datetime.now().strftime('%Y-%m-%d')
+            if self._avoid_date != today:
+                self._avoid_codes.clear()
+                self._avoid_names.clear()
+                self._avoid_date = today
+            
             for stock in new_stocks[:20]:  # 상위 20개만
                 code = stock.get('code', '')
                 price = stock.get('price', 0)
@@ -652,16 +809,46 @@ class ScalpEngine:
                 if code in self._trackers:
                     continue
                 
+                # ========================================
+                # A안: 회피 목록 체크 (빠름, API 호출 없음)
+                # ========================================
+                if code in self._avoid_codes or name in self._avoid_names:
+                    logger.info(f"   ⏭️ 회피목록 스킵: {name}({code})")
+                    skipped_avoid += 1
+                    continue
+                
+                # ========================================
+                # B안: 실시간 AI 필터 (config에서 활성화 시에만)
+                # ========================================
+                ai_score = 50  # 기본값
+                ai_config = self.config.get('ai', {})
+                use_quick_filter = ai_config.get('use_for_quick_filter', False)
+                
+                if use_quick_filter and self.ai_engine:
+                    try:
+                        ai_result = self._quick_ai_filter(code, name, price)
+                        if ai_result.get('avoid', False):
+                            # 회피 목록에 추가 (code + name 둘 다)
+                            self._avoid_codes.add(code)
+                            self._avoid_names.add(name)
+                            reason = ai_result.get('reason', '조건 미충족')
+                            logger.info(f"   🚫 AI 필터 제외: {name}({code}) - {reason}")
+                            skipped_ai += 1
+                            continue
+                        ai_score = ai_result.get('score', 50)
+                    except Exception as e:
+                        logger.debug(f"   AI 필터 실패 ({name}): {e}")
+                
                 # 새 종목 추가
                 self._trackers[code] = StockTracker(
                     code=code,
                     name=name,
                     prev_close=price,  # 현재가를 기준으로
-                    ai_score=50,  # 기본 점수
+                    ai_score=ai_score,
                     scenarios={},
                 )
                 added_count += 1
-                logger.info(f"   + 추가: {name}({code}) {price:,}원")
+                logger.info(f"   + 추가: {name}({code}) {price:,}원 (AI:{ai_score}점)")
             
             # 너무 많으면 오래된 것 제거 (최대 20개 유지)
             max_universe = 20
@@ -680,21 +867,121 @@ class ScalpEngine:
                     del self._trackers[old_code]
             
             self._last_universe_refresh = now
-            logger.info(f"✅ 유니버스 갱신 완료: +{added_count}개, 총 {len(self._trackers)}개")
+            skip_info = f"(회피:{skipped_avoid}, AI제외:{skipped_ai})" if (skipped_avoid + skipped_ai) > 0 else ""
+            logger.info(f"✅ 유니버스 갱신 완료: +{added_count}개, 총 {len(self._trackers)}개 {skip_info}")
             
         except Exception as e:
             logger.error(f"유니버스 갱신 실패: {e}")
             self._last_universe_refresh = now
     
+    def _quick_ai_filter(self, code: str, name: str, price: float) -> Dict[str, Any]:
+        """
+        장중 유니버스 갱신용 빠른 AI 필터
+        
+        Returns:
+            {
+                'avoid': bool,      # True면 제외
+                'score': int,       # 0-100 점수
+                'reason': str,      # 제외 이유 (avoid=True일 때)
+            }
+        """
+        if not self.ai_engine:
+            return {'avoid': False, 'score': 50, 'reason': ''}
+        
+        # 간단한 프롬프트 (JSON만 응답 강조)
+        prompt = f"""{name}({code}) {price:,.0f}원 - 스캘핑 적합?
+JSON만: {{"avoid":false,"score":70,"reason":""}}
+avoid=true: 관리종목/급락/과열
+모르면 score:50"""
+
+        try:
+            import json
+            import re
+            response = self.ai_engine.generate(
+                prompt=prompt,
+                max_tokens=10000,  # 테스트: 충분히 늘려서 파싱 성공률 확인
+            )
+            
+            # 응답 로그 (테스트용 INFO)
+            response_len = len(response)
+            logger.info(f"   🤖 AI필터 [{name}] 응답:{response_len}자")
+            
+            # JSON 추출 (여러 방법 시도)
+            text = response.strip()
+            
+            # 방법1: ```json 블록에서 추출
+            if '```' in text:
+                match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
+                if match:
+                    text = match.group(1)
+            
+            # 방법2: { } 사이만 추출
+            match = re.search(r'\{[^{}]*\}', text)
+            if match:
+                text = match.group(0)
+            
+            result = json.loads(text)
+            
+            # 파싱 성공 로그
+            score = result.get('score', 50)
+            avoid = result.get('avoid', False)
+            reason = result.get('reason', '')
+            
+            # avoid=true일 때만 상세 로그
+            if avoid:
+                logger.info(f"      → avoid=True, score={score}, reason={reason[:50]}")
+            
+            return {
+                'avoid': avoid,
+                'score': score,
+                'reason': reason,
+            }
+            
+        except Exception as e:
+            logger.debug(f"AI 필터 파싱 실패 ({name}): {e}")
+            return {'avoid': False, 'score': 50, 'reason': ''}
+    
     def _scan_for_entry(self, market_state):
         """진입 기회 스캔"""
         self._stats['scans'] += 1
+        
+        # 🍽️ 점심시간 매수 금지 (config에서 설정)
+        current_time = datetime.now().time()
+        
+        trading_config = self.config.get('trading', {})
+        lunch_start_str = trading_config.get('lunch_break_start', '11:30')
+        lunch_end_str = trading_config.get('lunch_break_end', '13:00')
+        lunch_enabled = trading_config.get('lunch_break_enabled', True)
+        
+        if lunch_enabled:
+            h, m = map(int, lunch_start_str.split(':'))
+            lunch_start = dt_time(h, m)
+            h, m = map(int, lunch_end_str.split(':'))
+            lunch_end = dt_time(h, m)
+            
+            if lunch_start <= current_time < lunch_end:
+                # 1분마다 한 번만 로그
+                if not hasattr(self, '_last_lunch_log') or \
+                   (datetime.now() - self._last_lunch_log).seconds >= 60:
+                    logger.info(f"🍽️ 점심시간 - 매수 중지 ({current_time.strftime('%H:%M')}, ~{lunch_end_str})")
+                    self._last_lunch_log = datetime.now()
+                return None
+        
+        # ☕ 연패 휴식 체크
+        if self.kill_switch and self.kill_switch.is_resting():
+            remaining = self.kill_switch.get_rest_remaining()
+            # 1분마다 한 번만 로그
+            if not hasattr(self, '_last_rest_log') or \
+               (datetime.now() - self._last_rest_log).seconds >= 60:
+                logger.info(f"☕ 휴식 중 - 매수 중지 (남은 시간: {remaining // 60}분 {remaining % 60}초)")
+                self._last_rest_log = datetime.now()
+            return None
         
         # 마켓 컨텍스트
         context = MarketContext(
             kospi_change_pct=market_state.kospi_change,
             kosdaq_change_pct=market_state.kosdaq_change,
-            current_time=datetime.now().time(),
+            current_time=current_time,
             conservative_mode=(market_state.mode == MarketMode.CONSERVATIVE),
             emergency_mode=(market_state.mode == MarketMode.EMERGENCY),
         )
@@ -1004,6 +1291,14 @@ class ScalpEngine:
                 logger.info(f"✅ 매도 완료: {position.stock_name}")
             else:
                 logger.error(f"❌ 매도 실패: {order_result.error}")
+                
+                # 🔧 "수량 초과" 에러 = 실제로 보유하지 않음 → 포지션 강제 삭제
+                if "수량" in str(order_result.error) and "초과" in str(order_result.error):
+                    logger.warning(f"⚠️ 보유 수량 불일치 감지 - 포지션 강제 삭제: {position.stock_name}")
+                    self.position_manager.remove_position(stock_code)
+                    # 쿨타임도 설정 (같은 종목 재진입 방지)
+                    if self.cooldown_tracker:
+                        self.cooldown_tracker.set_cooldown(stock_code, minutes=10)
         else:
             logger.info(f"📝 [시뮬] 매도: {position.stock_name} (LIVE_DATA_ONLY 모드)")
     
