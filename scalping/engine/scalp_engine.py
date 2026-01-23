@@ -223,15 +223,51 @@ class ScalpEngine:
             kis_config = self.secrets.get('kis', {})
             self.broker = KISBroker(config=kis_config, dry_run=(self.mode == 'LIVE_DATA_ONLY'))
             
-            # 연결 테스트 (잔고 조회)
+            # 🆕 v3.2.3 상세 계좌 정보 출력
             try:
                 balance = self.broker.get_balance()
                 if balance:
-                    logger.info(f"   ✅ 브로커 연결 성공 (예수금: {balance.get('available_cash', 0):,.0f}원)")
+                    available_cash = balance.get('available_cash', 0)
+                    total_eval = balance.get('total_eval', 0)
+                    
+                    logger.info(f"   ✅ 브로커 연결 성공")
+                    logger.info(f"   ┌─────────────────────────────────────")
+                    logger.info(f"   │ 💰 예수금(주문가능): {available_cash:,.0f}원")
+                    logger.info(f"   │ 📊 총 평가금액: {total_eval:,.0f}원")
+                    
+                    # 🆕 실제 보유종목 조회 (메서드가 있는 경우에만)
+                    if hasattr(self.broker, 'get_holdings'):
+                        try:
+                            holdings = self.broker.get_holdings()
+                            if holdings:
+                                logger.info(f"   │ 📦 실제 보유종목: {len(holdings)}개")
+                                for h in holdings:
+                                    code = h.get('stock_code', '')
+                                    name = h.get('stock_name', '')
+                                    qty = h.get('quantity', 0)
+                                    avg_price = h.get('avg_price', 0)
+                                    curr_price = h.get('current_price', 0)
+                                    pnl_pct = h.get('profit_pct', 0)
+                                    logger.info(f"   │   - {name}({code}): {qty}주 @ {avg_price:,.0f}원 → {curr_price:,.0f}원 ({pnl_pct:+.2f}%)")
+                                
+                                self._actual_holdings = {h.get('stock_code'): h for h in holdings}
+                            else:
+                                logger.info(f"   │ 📦 실제 보유종목: 0개")
+                                self._actual_holdings = {}
+                        except Exception as e:
+                            logger.debug(f"보유종목 조회 실패: {e}")
+                            self._actual_holdings = {}
+                    else:
+                        logger.info(f"   │ 📦 보유종목 조회: 미지원")
+                        self._actual_holdings = {}
+                    
+                    logger.info(f"   └─────────────────────────────────────")
                 else:
                     logger.warning("   ⚠️ 잔고 조회 실패 - 계속 진행")
+                    self._actual_holdings = {}
             except Exception as e:
                 logger.warning(f"   ⚠️ 브로커 연결 테스트 실패: {e}")
+                self._actual_holdings = {}
             logger.info("   ✅ 브로커 초기화 완료")
             
             # 2. 포지션 매니저
@@ -242,6 +278,40 @@ class ScalpEngine:
                 use_vwap_stop=self.use_vwap_stop,                # 🆕
                 use_breakout_stop=self.use_breakout_stop,        # 🆕
             )
+            
+            # 🆕 v3.2.3 실제 보유종목과 DB 포지션 동기화 (선택적)
+            try:
+                db_positions = self.position_manager.get_all_positions()
+                
+                # list인 경우 dict로 변환
+                if isinstance(db_positions, list):
+                    db_codes = set(p.stock_code if hasattr(p, 'stock_code') else p.get('stock_code', '') for p in db_positions)
+                elif isinstance(db_positions, dict):
+                    db_codes = set(db_positions.keys())
+                else:
+                    db_codes = set()
+                
+                actual_codes = set(self._actual_holdings.keys()) if hasattr(self, '_actual_holdings') and self._actual_holdings else set()
+                
+                # DB에는 있지만 실제로 없는 포지션 (유령 포지션) - actual_holdings 조회가 성공한 경우만
+                if actual_codes or self._actual_holdings == {}:  # 실제로 0개거나 조회 성공한 경우
+                    ghost_positions = db_codes - actual_codes
+                    if ghost_positions:
+                        logger.warning(f"   ⚠️ 유령 포지션 발견 (DB에만 존재): {ghost_positions}")
+                        for code in ghost_positions:
+                            logger.warning(f"      → {code} 포지션 제거")
+                            self.position_manager.remove_position(code)
+                
+                # 실제로는 있지만 DB에 없는 종목 (미등록 보유)
+                untracked = actual_codes - db_codes
+                if untracked:
+                    logger.warning(f"   ⚠️ 미등록 보유종목 발견 (HTS에만 존재): {untracked}")
+                    for code in untracked:
+                        h = self._actual_holdings.get(code, {})
+                        logger.warning(f"      → {h.get('stock_name', code)}: {h.get('quantity', 0)}주 - 수동 관리 필요")
+            except Exception as e:
+                logger.debug(f"포지션 동기화 스킵: {e}")
+            
             logger.info("   ✅ 포지션 매니저 초기화 완료")
             
             # 3. 시장 모니터
@@ -259,6 +329,16 @@ class ScalpEngine:
                 rest_minutes=safety_config.get('rest_minutes', 10),
             )
             self.cooldown_tracker = CooldownTracker()
+            
+            # 🆕 v3.2.3 Safety 설정 상세 출력
+            logger.info(f"   ┌─────────────────────────────────────")
+            logger.info(f"   │ 📊 거래 설정 (config.yaml)")
+            logger.info(f"   │   - 최대 포지션: {self.max_positions}개")
+            logger.info(f"   │   - 종목당 금액: {self.max_position_size:,.0f}원")
+            logger.info(f"   │   - 연속손절 휴식: {safety_config.get('consecutive_loss_rest', 3)}회 → {safety_config.get('rest_minutes', 10)}분")
+            logger.info(f"   │   - 연속손절 중단: {safety_config.get('consecutive_loss_stop', 7)}회")
+            logger.info(f"   │   - 일일손실 한도: {safety_config.get('max_daily_loss_pct', -3.0)}%")
+            logger.info(f"   └─────────────────────────────────────")
             logger.info("   ✅ 안전장치 초기화 완료")
             
             # 5. 종목 매퍼
@@ -303,6 +383,11 @@ class ScalpEngine:
             self.adaptive_mode = AdaptiveMode(adaptive_config)
             # AdaptiveMode의 min_score로 초기화
             self.min_score = self.adaptive_mode.get_min_score()
+            
+            # 🆕 v3.2.3 SignalGenerator에도 min_score 전달
+            if self.signal_generator:
+                self.signal_generator.set_min_score(self.min_score)
+            
             logger.info(f"   ✅ Adaptive Mode 초기화 완료 "
                        f"(모드: {self.adaptive_mode.get_current_mode().value}, "
                        f"min_score: {self.min_score})")
@@ -326,6 +411,9 @@ class ScalpEngine:
             logger.info("✅ 모든 컴포넌트 초기화 완료")
             logger.info("=" * 60)
             
+            # 🆕 v3.2.3 미체결 주문 확인 및 취소
+            self._check_pending_orders()
+            
             # 이전 상태 확인
             self._check_previous_state()
             
@@ -336,6 +424,43 @@ class ScalpEngine:
             import traceback
             traceback.print_exc()
             return False
+    
+    def _check_pending_orders(self):
+        """
+        🆕 v3.2.3 시작 시 미체결 주문 확인 및 취소
+        
+        프로그램 비정상 종료 시 미체결 주문이 남아있을 수 있음.
+        시작 시 미체결 주문이 있으면 전량 취소.
+        """
+        if not self.broker or self.mode == 'LIVE_DATA_ONLY':
+            return
+        
+        try:
+            pending = self.broker.get_pending_orders()
+            
+            if not pending:
+                logger.info("✅ 미체결 주문 없음")
+                return
+            
+            logger.warning(f"\n⚠️ 미체결 주문 {len(pending)}건 발견!")
+            logger.info("   ┌─────────────────────────────────────")
+            for order in pending:
+                side_str = "매수" if order.side == 'buy' else "매도"
+                logger.info(f"   │ {order.stock_name}({order.stock_code}) "
+                           f"{side_str} {order.pending_qty}주 @ {order.order_price:,.0f}원")
+            logger.info("   └─────────────────────────────────────")
+            
+            # 자동 취소
+            logger.info("   → 미체결 주문 전량 취소 중...")
+            cancelled = self.broker.cancel_all_pending_orders()
+            
+            if cancelled > 0:
+                logger.info(f"   ✅ {cancelled}건 취소 완료")
+            else:
+                logger.warning("   ⚠️ 취소 실패 - HTS에서 수동 확인 필요")
+            
+        except Exception as e:
+            logger.error(f"미체결 주문 확인 실패: {e}")
     
     def _check_previous_state(self):
         """이전 종료 상태 확인"""
@@ -358,6 +483,54 @@ class ScalpEngine:
             logger.info(f"   종료 시간: {shutdown_time}")
             logger.info(f"   거래 횟수: {prev_trades}건")
             logger.info(f"   유니버스: {len(prev_universe)}종목")
+            
+            # 🆕 v3.2.3 오늘 거래 기록 복원 (같은 날짜인 경우만)
+            shutdown_date = ""
+            today_date = datetime.now().strftime('%Y-%m-%d')
+            
+            if shutdown_time:
+                shutdown_date = shutdown_time.split('T')[0]
+                
+                if shutdown_date == today_date:
+                    prev_today_trades = state.get('today_trades', [])
+                    if prev_today_trades:
+                        for t in prev_today_trades:
+                            # datetime 문자열 → datetime 객체
+                            if isinstance(t.get('time'), str):
+                                t['time'] = datetime.fromisoformat(t['time'])
+                            self._today_trades.append(t)
+                        
+                        # stats도 복원
+                        prev_stats = state.get('stats', {})
+                        self._stats['buys'] = prev_stats.get('buys', 0)
+                        self._stats['sells'] = prev_stats.get('sells', 0)
+                        self._stats['wins'] = prev_stats.get('wins', 0)
+                        self._stats['losses'] = prev_stats.get('losses', 0)
+                        
+                        logger.info(f"   ✅ 오늘 거래 기록 복원: {len(prev_today_trades)}건")
+                        logger.info(f"      (승:{self._stats['wins']}, 패:{self._stats['losses']})")
+                    
+                    # 🆕 연속 손절 카운트 복원
+                    if self.kill_switch:
+                        prev_consecutive = state.get('consecutive_losses', 0)
+                        if prev_consecutive > 0:
+                            self.kill_switch.consecutive_losses = prev_consecutive
+                            logger.info(f"   ✅ 연속 손절 카운트 복원: {prev_consecutive}회")
+                    
+                    # 🆕 AdaptiveMode 상태 복원
+                    if self.adaptive_mode:
+                        prev_mode = state.get('adaptive_mode_state', 'BALANCED')
+                        try:
+                            from scalping.strategy.adaptive_mode import TradingMode
+                            self.adaptive_mode.current_mode = TradingMode[prev_mode]
+                            self.min_score = self.adaptive_mode.get_min_score()
+                            if self.signal_generator:
+                                self.signal_generator.set_min_score(self.min_score)
+                            logger.info(f"   ✅ AdaptiveMode 복원: {prev_mode} (min_score: {self.min_score})")
+                        except Exception as e:
+                            logger.debug(f"AdaptiveMode 복원 실패: {e}")
+                else:
+                    logger.info("   → 새로운 날짜 - 거래 기록 초기화")
             
             # 파일 삭제 (새 세션 시작)
             state_file.unlink()
@@ -495,11 +668,11 @@ class ScalpEngine:
                 current_time = now.time()
                 
                 # 프리마켓 분석 (08:00~08:50)
-                if dt_time(8, 0) <= current_time < dt_time(8, 50):
+                if dt_time(8, 50) <= current_time < dt_time(9, 0):
                     self._run_premarket()
                 
                 # 갭 분석 (08:50~09:05)
-                elif dt_time(8, 50) <= current_time < self.market_open:
+                elif dt_time(9, 0) <= current_time < self.market_open:
                     self._analyze_gaps()
                 
                 # 스캘핑 매매 (09:05~14:50)
@@ -627,6 +800,26 @@ class ScalpEngine:
                 'mode': self.mode,
                 'premarket_done': self.premarket_result is not None,
                 'universe': list(self._trackers.keys()) if self._trackers else [],
+                # 🆕 v3.2.3 오늘 거래 기록 저장 (재시작 시 복원용)
+                'today_trades': [
+                    {
+                        'time': t['time'].isoformat() if isinstance(t['time'], datetime) else t['time'],
+                        'side': t['side'],
+                        'code': t['code'],
+                        'name': t['name'],
+                        'price': t['price'],
+                        'quantity': t.get('quantity', 0),
+                        'profit_pct': t.get('profit_pct', 0),
+                        'reason': t.get('reason', ''),
+                        'score': t.get('score', 0),
+                        'signal_type': t.get('signal_type', ''),
+                    }
+                    for t in self._today_trades
+                ],
+                # 🆕 연속 손절 카운트 저장
+                'consecutive_losses': self.kill_switch.consecutive_losses if self.kill_switch else 0,
+                # 🆕 AdaptiveMode 상태 저장
+                'adaptive_mode_state': self.adaptive_mode.get_current_mode().value if self.adaptive_mode else 'BALANCED',
             }
             
             state_file = Path('logs') / 'last_state.json'
@@ -1170,6 +1363,19 @@ avoid=true: 관리종목/급락/과열
             logger.warning(f"수량 0 - 매수 불가 ({tracker.name})")
             return
         
+        # 🆕 v3.2.3 매수 전 예수금 확인
+        required_amount = price * quantity
+        try:
+            balance = self.broker.get_balance()
+            available_cash = balance.get('available_cash', 0) if balance else 0
+            
+            if available_cash < required_amount:
+                logger.warning(f"⚠️ 예수금 부족 - 매수 스킵: {tracker.name}")
+                logger.warning(f"   필요: {required_amount:,.0f}원, 가용: {available_cash:,.0f}원")
+                return
+        except Exception as e:
+            logger.warning(f"예수금 조회 실패: {e} - 매수 시도 계속")
+        
         logger.info(f"\n{'='*50}")
         logger.info(f"🔵 매수 시그널: {tracker.name} ({stock_code})")
         logger.info(f"   점수: {signal.score:.0f}점 ({signal.signal_type.value})")
@@ -1226,6 +1432,19 @@ avoid=true: 관리종목/급락/과열
                 logger.info(f"✅ 매수 완료: {tracker.name}")
             else:
                 logger.error(f"❌ 매수 실패: {order_result.error}")
+                
+                # 🆕 v3.2.3 주문 실패 시 해당 종목 미체결 주문 취소
+                # (시장가가 미체결 대기 상태로 남아있을 수 있음)
+                try:
+                    cancelled = self.broker.cancel_pending_for_stock(stock_code)
+                    if cancelled > 0:
+                        logger.info(f"   → {stock_code} 미체결 {cancelled}건 취소")
+                except Exception as e:
+                    logger.debug(f"미체결 취소 실패: {e}")
+                
+                # 쿨타임 설정 (재진입 방지)
+                if self.cooldown_tracker:
+                    self.cooldown_tracker.set_cooldown(stock_code, minutes=5)
         else:
             logger.info(f"📝 [시뮬] 매수: {tracker.name} (LIVE_DATA_ONLY 모드)")
     
@@ -1310,6 +1529,19 @@ avoid=true: 관리종목/급락/과열
                 is_win = profit_pct > 0
                 self.kill_switch.record_trade(is_win=is_win, stock_code=stock_code)
                 
+                # 🆕 v3.2.3 AdaptiveMode 업데이트 및 min_score 동기화
+                if self.adaptive_mode:
+                    old_mode = self.adaptive_mode.get_current_mode()
+                    self.adaptive_mode.record_trade_result(is_win=is_win)
+                    new_mode = self.adaptive_mode.get_current_mode()
+                    
+                    # 모드 변경 시 min_score 동기화
+                    if old_mode != new_mode:
+                        self.min_score = self.adaptive_mode.get_min_score()
+                        if self.signal_generator:
+                            self.signal_generator.set_min_score(self.min_score)
+                        logger.info(f"🔄 모드 전환: {old_mode.value} → {new_mode.value} (min_score: {self.min_score})")
+                
                 # Discord 알림
                 if self.notifier:
                     self.notifier.send_sell_signal(
@@ -1324,6 +1556,14 @@ avoid=true: 관리종목/급락/과열
                 logger.info(f"✅ 매도 완료: {position.stock_name}")
             else:
                 logger.error(f"❌ 매도 실패: {order_result.error}")
+                
+                # 🆕 v3.2.3 매도 실패 시 해당 종목 미체결 주문 취소
+                try:
+                    cancelled = self.broker.cancel_pending_for_stock(stock_code)
+                    if cancelled > 0:
+                        logger.info(f"   → {stock_code} 미체결 {cancelled}건 취소")
+                except Exception as e:
+                    logger.debug(f"미체결 취소 실패: {e}")
                 
                 # 🔧 "수량 초과" 에러 = 실제로 보유하지 않음 → 포지션 강제 삭제
                 if "수량" in str(order_result.error) and "초과" in str(order_result.error):

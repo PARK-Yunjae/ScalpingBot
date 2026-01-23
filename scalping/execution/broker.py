@@ -810,24 +810,83 @@ class KISBroker:
     
     def cancel_all_pending_orders(self) -> int:
         """
-        모든 미체결 주문 취소
+        🆕 v3.2.3 전체 미체결 주문 취소
         
         Returns:
             취소된 주문 수
         """
-        pending = self.get_pending_orders()
-        cancelled = 0
+        if self.dry_run:
+            logger.info("🔸 [DRY RUN] 미체결 주문 전량 취소")
+            return 0
         
-        for order in pending:
-            if self.cancel_order(
-                order_id=order.order_id,
-                stock_code=order.stock_code,
-                quantity=order.pending_qty,
-            ):
-                cancelled += 1
+        try:
+            pending = self.get_pending_orders()
+            if not pending:
+                logger.info("✅ 미체결 주문 없음")
+                return 0
+            
+            cancelled = 0
+            for order in pending:
+                try:
+                    success = self.cancel_order(
+                        order_id=order.order_id,
+                        stock_code=order.stock_code,
+                        quantity=order.pending_qty,
+                    )
+                    if success:
+                        cancelled += 1
+                        logger.info(f"  ✅ {order.stock_name}({order.stock_code}) {order.pending_qty}주 취소")
+                    else:
+                        logger.warning(f"  ⚠️ {order.stock_name} 취소 실패")
+                except Exception as e:
+                    logger.error(f"  ❌ {order.stock_name} 취소 에러: {e}")
+            
+            logger.info(f"✅ 미체결 주문 {cancelled}/{len(pending)}건 취소 완료")
+            return cancelled
         
-        logger.info(f"미체결 주문 {cancelled}/{len(pending)}건 취소 완료")
-        return cancelled
+        except Exception as e:
+            logger.error(f"미체결 전량 취소 에러: {e}")
+            return 0
+    
+    def cancel_pending_for_stock(self, stock_code: str) -> int:
+        """
+        🆕 v3.2.3 특정 종목 미체결 주문 취소
+        
+        Args:
+            stock_code: 종목 코드
+        
+        Returns:
+            취소된 주문 수
+        """
+        if self.dry_run:
+            return 0
+        
+        try:
+            pending = self.get_pending_orders()
+            target_orders = [o for o in pending if o.stock_code == stock_code]
+            
+            if not target_orders:
+                return 0
+            
+            cancelled = 0
+            for order in target_orders:
+                try:
+                    success = self.cancel_order(
+                        order_id=order.order_id,
+                        stock_code=order.stock_code,
+                        quantity=order.pending_qty,
+                    )
+                    if success:
+                        cancelled += 1
+                        logger.info(f"  ✅ {order.stock_name} 미체결 {order.pending_qty}주 취소")
+                except Exception as e:
+                    logger.error(f"  ❌ {order.stock_name} 취소 에러: {e}")
+            
+            return cancelled
+        
+        except Exception as e:
+            logger.error(f"종목 미체결 취소 에러: {e}")
+            return 0
     
     # =========================================================================
     # 조회 관련
@@ -842,8 +901,10 @@ class KISBroker:
             {
                 'total_eval': float,       # 총 평가금액
                 'total_profit': float,     # 총 평가손익
-                'cash': float,             # 예수금
-                'available_cash': float,   # 주문가능금액
+                'cash': float,             # 예수금총액 (D+2)
+                'available_cash': float,   # 주문가능현금 (실제 당장 쓸 수 있는 돈)
+                'd2_deposit': float,       # D+2예수금
+                'next_day_amt': float,     # 익일정산금액
             }
         """
         if self.dry_run:
@@ -852,6 +913,8 @@ class KISBroker:
                 'total_profit': 0,
                 'cash': 5000000,
                 'available_cash': 5000000,
+                'd2_deposit': 5000000,
+                'next_day_amt': 5000000,
             }
         
         try:
@@ -880,11 +943,41 @@ class KISBroker:
             
             output2 = response.get('output2', [{}])[0] if response.get('output2') else {}
             
+            # 🆕 v3.2.3 - 필드별 금액 파싱
+            d2_deposit = float(output2.get('dnca_tot_amt', 0))        # D+2 예수금
+            next_day_amt = float(output2.get('nxdy_excc_amt', 0))     # 익일정산금액
+            prvs_amt = float(output2.get('prvs_rcdl_excc_amt', 0))    # 가수도정산금액
+            tot_evlu = float(output2.get('scts_evlu_amt', 0))         # 총평가금액
+            tot_profit = float(output2.get('evlu_pfls_smtl_amt', 0))  # 총평가손익
+            
+            # 🆕 주문가능현금 계산
+            # KIS API에서 직접 제공하는 필드가 없으면 보수적으로 계산
+            # 방법1: 가수도정산금액 사용 (가장 보수적)
+            # 방법2: D+2 예수금 - 보유종목 평가금액
+            # 방법3: 별도 API (매수가능조회) 호출
+            
+            # 현재 보유종목 평가금액 합계
+            holding_eval = float(output2.get('evlu_amt_smtl_amt', 0))  # 평가금액합계
+            pchs_amt = float(output2.get('pchs_amt_smtl_amt', 0))      # 매입금액합계
+            
+            # 🆕 실제 주문가능금액 = D+2예수금 - 매입금액 (이미 투자된 금액)
+            # 또는 더 보수적으로: 가수도정산금액 사용
+            available_cash = prvs_amt if prvs_amt > 0 else max(0, d2_deposit - pchs_amt)
+            
+            # 디버깅용 로그 (최초 1회만)
+            if not hasattr(self, '_balance_logged'):
+                logger.debug(f"잔고조회 상세: D+2={d2_deposit:,.0f}, 익일={next_day_amt:,.0f}, "
+                           f"가수도={prvs_amt:,.0f}, 매입합계={pchs_amt:,.0f}, "
+                           f"→ 주문가능={available_cash:,.0f}")
+                self._balance_logged = True
+            
             return {
-                'total_eval': float(output2.get('scts_evlu_amt', 0)),
-                'total_profit': float(output2.get('evlu_pfls_smtl_amt', 0)),
-                'cash': float(output2.get('prvs_rcdl_excc_amt', 0)),
-                'available_cash': float(output2.get('nxdy_excc_amt', 0)),
+                'total_eval': tot_evlu,
+                'total_profit': tot_profit,
+                'cash': d2_deposit,                    # D+2 예수금 (총 예수금)
+                'available_cash': available_cash,     # 🆕 실제 주문가능금액
+                'd2_deposit': d2_deposit,             # 🆕 D+2 예수금
+                'next_day_amt': next_day_amt,         # 🆕 익일정산금액
                 'raw_response': response,
             }
         
@@ -895,6 +988,8 @@ class KISBroker:
                 'total_profit': 0,
                 'cash': 0,
                 'available_cash': 0,
+                'd2_deposit': 0,
+                'next_day_amt': 0,
             }
     
     def get_positions(self) -> List[Position]:
@@ -964,6 +1059,41 @@ class KISBroker:
         except Exception as e:
             logger.error(f"보유종목 조회 에러: {e}")
             return []
+    
+    def get_holdings(self) -> List[Dict]:
+        """
+        🆕 v3.2.3 보유 종목 조회 (딕셔너리 형태)
+        
+        scalp_engine.py에서 호출하는 메서드.
+        get_positions()를 래핑하여 딕셔너리 리스트로 반환.
+        
+        Returns:
+            보유종목 리스트
+            [
+                {
+                    'stock_code': str,
+                    'stock_name': str,
+                    'quantity': int,
+                    'avg_price': float,
+                    'current_price': float,
+                    'profit_pct': float,
+                },
+                ...
+            ]
+        """
+        positions = self.get_positions()
+        
+        return [
+            {
+                'stock_code': p.stock_code,
+                'stock_name': p.stock_name,
+                'quantity': p.quantity,
+                'avg_price': p.avg_price,
+                'current_price': p.current_price,
+                'profit_pct': p.profit_pct,
+            }
+            for p in positions
+        ]
     
     def get_pending_orders(self) -> List[PendingOrder]:
         """

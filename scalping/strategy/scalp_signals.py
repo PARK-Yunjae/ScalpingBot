@@ -67,7 +67,7 @@ class SignalParams:
     
     # 공통 필터
     VWAP_ABOVE_REQUIRED = True  # VWAP 위 필수
-    MIN_SCORE = 55              # 최소 진입 점수
+    MIN_SCORE = 80              # v3.2.3 기본값 (실전 데이터 기준)
 
 
 # =============================================================================
@@ -250,6 +250,20 @@ class ScalpSignalGenerator:
                    f"최소점수:{self.min_score})")
         if disabled:
             logger.info(f"   ⚠️ 비활성화 전략: {', '.join(disabled)}")
+    
+    def set_min_score(self, min_score: int):
+        """
+        🆕 v3.2.3 AdaptiveMode에서 min_score 동적 업데이트
+        
+        Args:
+            min_score: 새로운 최소 점수
+        """
+        old_score = self.min_score
+        self.min_score = min_score
+        self.min_score_conservative = min_score + 10
+        
+        if old_score != min_score:
+            logger.info(f"📊 min_score 변경: {old_score} → {min_score}")
     
     def evaluate(
         self,

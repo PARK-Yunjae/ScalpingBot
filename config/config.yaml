@@ -140,20 +140,21 @@ adaptive_mode:
   enabled: true
   default_mode: "BALANCED"
   
-  # 모드별 설정
+  # 모드별 설정 (v3.2.3 - 실전 데이터 기준)
+  # 80점 이상: 40% 승률, 80점 미만: 17% 승률
   modes:
     DEFENSIVE:
-      min_score: 75
+      min_score: 85
       cooldown_minutes: 15
-      description: "방어 모드 - 확실한 것만"
+      description: "방어 모드 - 확실한 것만 (85점 이상)"
     BALANCED:
-      min_score: 70
+      min_score: 80
       cooldown_minutes: 10
-      description: "균형 모드 - 기본값"
+      description: "균형 모드 - 기본값 (80점 이상)"
     AGGRESSIVE:
-      min_score: 65
+      min_score: 75
       cooldown_minutes: 5
-      description: "공격 모드 - 기회 확대"
+      description: "공격 모드 - 기회 확대 (75점 이상)"
   
   # 모드 전환 트리거
   triggers:
@@ -223,8 +224,8 @@ indicators:
 # -----------------------------------------
 safety:
   max_positions: 3
-  max_position_size: 130000
-  max_total_exposure: 450000
+  max_position_size: 100000
+  max_total_exposure: 300000
   
   max_daily_loss: -15000
   max_daily_loss_pct: -3.0
