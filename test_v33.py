@@ -48,9 +48,7 @@ except Exception as e:
     print(f"   ❌ scalp_signals.py import 실패: {e}")
     errors.append(f"import scalp_signals: {e}")
 
-# scalp_engine은 broker 연결 시도하므로 import만 테스트
 try:
-    # 모듈 자체만 import (인스턴스 생성 X)
     import scalping.engine.scalp_engine as scalp_engine_module
     print("   ✅ scalp_engine.py import 성공")
 except Exception as e:
@@ -67,7 +65,6 @@ try:
     config_loader = ConfigLoader('config/config.yaml')
     config = config_loader.load()
     
-    # 시뮬레이션 설정 확인
     mode = config.get('mode')
     sim_config = config.get('simulation', {})
     
@@ -90,22 +87,19 @@ except Exception as e:
 # =============================================================================
 print("\n[3/6] SimulationTracker 기본 기능 테스트...")
 
+tracker = None
 try:
-    import tempfile
-    import os
-    
-    # 임시 DB로 테스트
-    with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
-        test_db = f.name
+    # 실제 경로 사용 (임시 파일 대신)
+    test_db = BASE_DIR / 'db' / 'simulation_test.db'
+    test_db.parent.mkdir(parents=True, exist_ok=True)
     
     tracker = SimulationTracker(
-        db_path=test_db,
+        db_path=str(test_db),
         max_hold_minutes=30,
         max_concurrent=10,
     )
     print("   ✅ SimulationTracker 생성 성공")
     
-    # 가상 진입 테스트
     pos = tracker.enter_virtual(
         stock_code="005930",
         stock_name="삼성전자",
@@ -124,14 +118,13 @@ try:
         print("   ❌ 가상 진입 실패")
         errors.append("가상 진입 실패")
     
-    # 정리
-    os.unlink(test_db)
-    
 except Exception as e:
     print(f"   ❌ SimulationTracker 테스트 실패: {e}")
     import traceback
     traceback.print_exc()
     errors.append(f"SimulationTracker: {e}")
+finally:
+    tracker = None  # 연결 해제
 
 
 # =============================================================================
@@ -139,17 +132,12 @@ except Exception as e:
 # =============================================================================
 print("\n[4/6] 가격 업데이트 & 패턴 분석 테스트...")
 
+tracker = None
 try:
-    import tempfile
-    import os
-    import time
+    test_db = BASE_DIR / 'db' / 'simulation_test2.db'
     
-    with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
-        test_db = f.name
+    tracker = SimulationTracker(db_path=str(test_db), max_hold_minutes=1)
     
-    tracker = SimulationTracker(db_path=test_db, max_hold_minutes=1)
-    
-    # 가상 진입
     tracker.enter_virtual(
         stock_code="005930",
         stock_name="삼성전자",
@@ -160,12 +148,10 @@ try:
         stop_loss_pct=-0.8,
     )
     
-    # 가격 업데이트 시뮬레이션 (익절 시나리오)
     prices = {"005930": 10000}
     
-    # 점진적 상승
     for i in range(5):
-        prices["005930"] += 50  # +0.5%씩
+        prices["005930"] += 50
         results = tracker.update_prices(prices)
         
         if results:
@@ -174,9 +160,8 @@ try:
                 print(f"      - 패턴: {r.pattern}")
                 print(f"      - 히스토리 길이: {len(r.price_history)}")
     
-    # 아직 청산 안됐으면 손절 테스트
     if tracker.get_active_positions():
-        prices["005930"] = 9900  # -1%로 급락
+        prices["005930"] = 9900
         results = tracker.update_prices(prices)
         
         if results:
@@ -186,13 +171,13 @@ try:
     
     print("   ✅ 가격 업데이트 테스트 완료")
     
-    os.unlink(test_db)
-    
 except Exception as e:
     print(f"   ❌ 가격 업데이트 테스트 실패: {e}")
     import traceback
     traceback.print_exc()
     errors.append(f"가격 업데이트: {e}")
+finally:
+    tracker = None
 
 
 # =============================================================================
@@ -200,21 +185,16 @@ except Exception as e:
 # =============================================================================
 print("\n[5/6] 통계 & 리포트 테스트...")
 
+tracker = None
 try:
-    import tempfile
-    import os
-    from datetime import datetime
+    test_db = BASE_DIR / 'db' / 'simulation_test3.db'
     
-    with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
-        test_db = f.name
+    tracker = SimulationTracker(db_path=str(test_db), max_hold_minutes=1)
     
-    tracker = SimulationTracker(db_path=test_db, max_hold_minutes=1)
-    
-    # 여러 거래 시뮬레이션
     test_cases = [
-        ("005930", "삼성전자", 10000, 90, "breakout", 10300),  # 익절
-        ("035720", "카카오", 50000, 78, "pullback", 49500),    # 손절
-        ("000660", "SK하이닉스", 80000, 82, "breakout", 80500), # 시간초과
+        ("005930", "삼성전자", 10000, 90, "breakout", 10300),
+        ("035720", "카카오", 50000, 78, "pullback", 49500),
+        ("000660", "SK하이닉스", 80000, 82, "breakout", 80500),
     ]
     
     for code, name, entry, score, stype, exit_price in test_cases:
@@ -225,30 +205,25 @@ try:
             signal_score=score,
             signal_type=stype,
         )
-        
-        # 바로 청산 (익절 또는 손절)
         tracker.update_prices({code: exit_price})
     
-    # 남은 포지션 강제 청산
     tracker.close_all()
     
-    # 통계 조회
     stats = tracker.get_daily_stats()
     print(f"   ✅ 통계 조회 성공")
     print(f"      - 총 신호: {stats['total']}회")
     print(f"      - 승률: {stats['win_rate']:.1f}%")
     
-    # 리포트 출력 테스트 (에러 없이 실행되는지)
     print("\n   --- 일일 리포트 테스트 ---")
     tracker.print_daily_report()
-    
-    os.unlink(test_db)
     
 except Exception as e:
     print(f"   ❌ 통계 테스트 실패: {e}")
     import traceback
     traceback.print_exc()
     errors.append(f"통계: {e}")
+finally:
+    tracker = None
 
 
 # =============================================================================
@@ -256,16 +231,12 @@ except Exception as e:
 # =============================================================================
 print("\n[6/6] 타임라인 조회 테스트...")
 
+tracker = None
 try:
-    import tempfile
-    import os
+    test_db = BASE_DIR / 'db' / 'simulation_test4.db'
     
-    with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
-        test_db = f.name
+    tracker = SimulationTracker(db_path=str(test_db), max_hold_minutes=5)
     
-    tracker = SimulationTracker(db_path=test_db, max_hold_minutes=5)
-    
-    # 가상 진입
     tracker.enter_virtual(
         stock_code="005930",
         stock_name="삼성전자",
@@ -274,19 +245,16 @@ try:
         signal_type="breakout",
     )
     
-    # 가격 변동 시뮬레이션 (여러 번 업데이트)
     price = 10000
     for i in range(6):
         if i < 3:
-            price += 30  # 상승
+            price += 30
         else:
-            price -= 50  # 하락
+            price -= 50
         tracker.update_prices({"005930": price})
     
-    # 손절 트리거
     tracker.update_prices({"005930": 9900})
     
-    # 타임라인 조회
     trade = tracker.get_trade_timeline(stock_code="005930")
     
     if trade:
@@ -296,19 +264,45 @@ try:
         print(f"      - 히스토리: {len(trade['price_history'])}개 포인트")
         print(f"      - 패턴: {trade['pattern']}")
         
-        # 타임라인 출력 테스트
         print("\n   --- 타임라인 출력 테스트 ---")
         tracker.print_trade_timeline(stock_code="005930")
     else:
         print("   ⚠️ 타임라인 조회 결과 없음")
-    
-    os.unlink(test_db)
     
 except Exception as e:
     print(f"   ❌ 타임라인 테스트 실패: {e}")
     import traceback
     traceback.print_exc()
     errors.append(f"타임라인: {e}")
+finally:
+    tracker = None
+
+
+# =============================================================================
+# 테스트 DB 정리
+# =============================================================================
+print("\n[정리] 테스트 DB 파일 삭제...")
+import time
+import gc
+
+gc.collect()  # 가비지 컬렉션 강제 실행
+time.sleep(0.5)  # Windows에서 파일 핸들 해제 대기
+
+test_files = [
+    'simulation_test.db',
+    'simulation_test2.db', 
+    'simulation_test3.db',
+    'simulation_test4.db',
+]
+
+for fname in test_files:
+    test_file = BASE_DIR / 'db' / fname
+    try:
+        if test_file.exists():
+            test_file.unlink()
+            print(f"   ✅ {fname} 삭제")
+    except Exception as e:
+        print(f"   ⚠️ {fname} 삭제 실패 (무시해도 됨)")
 
 
 # =============================================================================
@@ -326,7 +320,7 @@ else:
     print("\n✅ 모든 테스트 통과!")
     print("\n다음 단계:")
     print("   1. config.yaml에서 mode: SIMULATION 확인")
-    print("   2. 장 시작 전에 실행")
+    print("   2. 장 시작 전에 실행: python scalping/engine/scalp_engine.py")
     print("   3. db/simulation.db 에 데이터 쌓임")
     print("   4. 장 종료 후 일일 리포트 확인")
 

@@ -234,7 +234,7 @@ class ScalpEngine:
             # 1. 브로커 초기화
             logger.info("\n[1/7] 브로커 초기화...")
             kis_config = self.secrets.get('kis', {})
-            self.broker = KISBroker(config=kis_config, dry_run=(self.mode == 'LIVE_DATA_ONLY'))
+            self.broker = KISBroker(config=kis_config, dry_run=(self.mode in ['LIVE_DATA_ONLY', 'SIMULATION']))
             
             # 🆕 v3.2.3 상세 계좌 정보 출력
             try:
@@ -459,7 +459,7 @@ class ScalpEngine:
         프로그램 비정상 종료 시 미체결 주문이 남아있을 수 있음.
         시작 시 미체결 주문이 있으면 전량 취소.
         """
-        if not self.broker or self.mode == 'LIVE_DATA_ONLY':
+        if not self.broker or self.mode in ['LIVE_DATA_ONLY', 'SIMULATION']:
             return
         
         try:

@@ -140,8 +140,8 @@ class TradingEngine:
         elif config.get('trading', {}).get('dry_run') is not None:
             self.dry_run = config['trading']['dry_run']
         else:
-            # mode가 LIVE_DATA_ONLY이면 dry_run=True
-            self.dry_run = config.get('mode', 'LIVE_DATA_ONLY') == 'LIVE_DATA_ONLY'
+            # mode가 LIVE_DATA_ONLY 또는 SIMULATION이면 dry_run=True
+            self.dry_run = config.get('mode', 'LIVE_DATA_ONLY') in ['LIVE_DATA_ONLY', 'SIMULATION']
         
         # max_positions: config.trading > config.safety > config.risk
         self.max_positions = (
