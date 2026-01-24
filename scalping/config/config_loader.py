@@ -51,7 +51,7 @@ logger = logging.getLogger('ScalpingBot.ConfigLoader')
 
 DEFAULT_CONFIG = {
     # 모드
-    'mode': 'LIVE_DATA_ONLY',  # LIVE_DATA_ONLY, LIVE_MICRO, LIVE
+    'mode': 'LIVE_DATA_ONLY',  # LIVE_DATA_ONLY, LIVE_MICRO, LIVE, SIMULATION
     
     # AI 설정
     'ai': {
@@ -178,7 +178,7 @@ class SchemaField:
 
 # 스키마 검증 규칙
 SCHEMA = [
-    SchemaField('mode', str, choices=['LIVE_DATA_ONLY', 'LIVE_MICRO', 'LIVE']),
+    SchemaField('mode', str, choices=['LIVE_DATA_ONLY', 'LIVE_MICRO', 'LIVE', 'SIMULATION']),
     SchemaField('ai.model', str, required=True),
     SchemaField('ai.timeout', int, min_value=1, max_value=60),
     SchemaField('ai.temperature', float, min_value=0, max_value=2),

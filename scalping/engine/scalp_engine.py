@@ -56,6 +56,7 @@ from scalping.strategy.scalp_signals import (
 )
 from scalping.strategy.adaptive_mode import AdaptiveMode, TradingMode  # 🆕 v3.2
 from scalping.strategy.funnel_log import FunnelLog, CandidateInfo      # 🆕 v3.2
+from scalping.strategy.simulation_tracker import SimulationTracker     # 🆕 v3.3
 from scalping.safety.kill_switch import KillSwitch
 from scalping.execution.cooldown_tracker import CooldownTracker
 from scalping.notification.discord_bot import DiscordNotifier
@@ -149,6 +150,18 @@ class ScalpEngine:
         # 🆕 v3.2 컴포넌트
         self.adaptive_mode: Optional[AdaptiveMode] = None
         self.funnel_log: Optional[FunnelLog] = None
+        
+        # 🆕 v3.3 시뮬레이션 모드
+        self.simulation_tracker: Optional[SimulationTracker] = None
+        self.is_simulation_mode = (self.config.get('mode', '') == 'SIMULATION')
+        
+        # 시뮬레이션 설정
+        sim_config = self.config.get('simulation', {})
+        self.sim_take_profit = sim_config.get('take_profit_pct', 2.5)
+        self.sim_stop_loss = sim_config.get('stop_loss_pct', -0.8)
+        self.sim_max_hold = sim_config.get('max_hold_minutes', 30)
+        self.sim_max_concurrent = sim_config.get('max_concurrent', 20)
+        self.sim_min_score = sim_config.get('min_score_to_track', 70)
         
         # 종목 트래커 (유니버스)
         self._trackers: Dict[str, StockTracker] = {}
@@ -397,6 +410,20 @@ class ScalpEngine:
             funnel_config = self.config.get('funnel_log', {})
             self.funnel_log = FunnelLog(funnel_config)
             logger.info("   ✅ Funnel Log 초기화 완료")
+            
+            # 🆕 v3.3 시뮬레이션 모드 초기화
+            if self.is_simulation_mode:
+                logger.info("\n[SIM] 시뮬레이션 트래커 초기화...")
+                self.simulation_tracker = SimulationTracker(
+                    db_path='db/simulation.db',
+                    max_hold_minutes=self.sim_max_hold,
+                    max_concurrent=self.sim_max_concurrent,
+                )
+                logger.info(f"   ✅ 시뮬레이션 모드 활성화 (매매 없음, 신호만 추적)")
+                logger.info(f"   - 익절 목표: +{self.sim_take_profit}%")
+                logger.info(f"   - 손절선: {self.sim_stop_loss}%")
+                logger.info(f"   - 최소 추적 점수: {self.sim_min_score}점")
+                logger.info(f"   - 최대 추적 시간: {self.sim_max_hold}분")
             
             # Discord 알림 (선택적)
             discord_config = self.config.get('discord', {})
@@ -1290,6 +1317,30 @@ avoid=true: 관리종목/급락/과열
             logger.info(f"🔍 스캔 통계: 총{scan_stats['total']} | 보유{scan_stats['holding']} | 쿨타임{scan_stats['cooldown']} | 데이터없음{scan_stats['no_data']} | 기술필터탈락{scan_stats['tech_fail']} | 시그널없음{scan_stats['no_signal']} | 후보{scan_stats['candidates']}")
             self._last_scan_log = now
         
+        # 🆕 v3.3 시뮬레이션: 가상 포지션 가격 업데이트
+        if self.is_simulation_mode and self.simulation_tracker:
+            active_positions = self.simulation_tracker.get_active_positions()
+            if active_positions:
+                price_dict = {}
+                for pos in active_positions:
+                    try:
+                        price_info = self.broker.get_current_price(pos.stock_code)
+                        if price_info and isinstance(price_info, dict):
+                            price_dict[pos.stock_code] = price_info.get('price', 0)
+                        elif price_info and isinstance(price_info, (int, float)):
+                            price_dict[pos.stock_code] = price_info
+                    except:
+                        pass
+                
+                if price_dict:
+                    closed = self.simulation_tracker.update_prices(price_dict)
+                    # Discord 알림 (선택적)
+                    if closed and self.notifier:
+                        for pos in closed:
+                            emoji = "✅" if pos.result.value == 'take_profit' else "❌"
+                            msg = f"{emoji} [SIM] {pos.stock_name}: {pos.exit_pct:+.2f}% ({pos.result.value})"
+                            self.notifier.send_message(msg)
+        
         # 최고 시그널로 매수
         if best_signal and best_signal.action == 'BUY':
             self._execute_buy(best_signal)
@@ -1354,6 +1405,21 @@ avoid=true: 관리종목/급락/과열
         
         if not tracker:
             return
+        
+        # 🆕 v3.3 시뮬레이션 모드: 실제 매수 대신 가상 진입
+        if self.is_simulation_mode and self.simulation_tracker:
+            if signal.score >= self.sim_min_score:
+                self.simulation_tracker.enter_virtual(
+                    stock_code=stock_code,
+                    stock_name=tracker.name,
+                    entry_price=signal.entry_price,
+                    signal_score=signal.score,
+                    signal_type=signal.signal_type.value,
+                    take_profit_pct=self.sim_take_profit,
+                    stop_loss_pct=self.sim_stop_loss,
+                )
+                self._stats['signals'] += 1
+            return  # 실제 매수하지 않음
         
         # 수량 계산
         price = signal.entry_price
@@ -1605,6 +1671,38 @@ avoid=true: 관리종목/급락/과열
         logger.info("\n" + "=" * 60)
         logger.info("📊 일일 리포트")
         logger.info("=" * 60)
+        
+        # 🆕 v3.3 시뮬레이션 모드 리포트
+        if self.is_simulation_mode and self.simulation_tracker:
+            # 미결 포지션 정리
+            self.simulation_tracker.close_all()
+            
+            # 통계 출력
+            self.simulation_tracker.print_daily_report()
+            
+            # CSV 내보내기
+            try:
+                csv_path = self.simulation_tracker.export_csv(days=1)
+                logger.info(f"📁 CSV 저장: {csv_path}")
+            except Exception as e:
+                logger.error(f"CSV 내보내기 실패: {e}")
+            
+            # 기간 통계 (누적)
+            period_stats = self.simulation_tracker.get_period_stats(days=30)
+            if period_stats['total'] > 0:
+                logger.info(f"\n📈 30일 누적 통계:")
+                logger.info(f"   총 신호: {period_stats['total']}회")
+                logger.info(f"   승률: {period_stats['win_rate']:.1f}%")
+                logger.info(f"   누적 수익률: {period_stats['total_pct']:+.2f}%")
+                
+                if period_stats['score_breakdown']:
+                    logger.info(f"\n   [점수대별 성과]")
+                    for s in period_stats['score_breakdown']:
+                        win_rate = (s['wins'] / s['count'] * 100) if s['count'] > 0 else 0
+                        logger.info(f"   {s['score_range']}: {s['count']}회, 승률 {win_rate:.1f}%, 합계 {s['total_pct']:+.2f}%")
+            
+            logger.info("=" * 60)
+            return  # 시뮬레이션 모드에서는 여기서 종료
         
         total_trades = len([t for t in self._today_trades if t['side'] == 'SELL'])
         wins = self._stats['wins']
